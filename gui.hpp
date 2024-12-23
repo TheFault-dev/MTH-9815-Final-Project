@@ -1,5 +1,5 @@
-#ifndef GUI_SERVICE_HPP
-#define GUI_SERVICE_HPP
+#ifndef GUI_HPP
+#define GUI_HPP
 
 #include <chrono>
 #include <fstream>
