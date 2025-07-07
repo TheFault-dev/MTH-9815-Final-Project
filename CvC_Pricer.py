@@ -193,3 +193,49 @@ rho_star = implied_corr(
 )
 
 print(f"Implied average pairwise correlation = {rho_star:.4f}")
+
+def greeks_cvc(
+        spots, vols, rho, strike, weights, T, curve,
+        n_paths=100_000, bump_pct=1e-4):
+
+    base = price_cvc(spots, vols, rho, strike, weights, T, curve, n_paths)
+    N    = len(spots)
+
+    deltas, gammas = [], []
+    for i in range(N):
+        up   = spots.copy();  up[i]   *= 1 + bump_pct
+        down = spots.copy();  down[i] *= 1 - bump_pct
+
+        p_up   = price_cvc(up,   vols, rho, strike, weights, T, curve, n_paths)
+        p_down = price_cvc(down, vols, rho, strike, weights, T, curve, n_paths)
+
+        delta  = (p_up - p_down) / (2 * spots[i] * bump_pct)
+        gamma  = (p_up - 2*base + p_down) / ((spots[i]*bump_pct)**2)
+
+        deltas.append(delta)
+        gammas.append(gamma)
+
+    # --- existing vega / volga / vanna / rho / rho_r / theta code here ---
+    …
+    return {
+        "price": base,
+        "delta": deltas,
+        "gamma": gammas,          # NEW
+        "vega": vegas,
+        "volga": volga,
+        "vanna": vanna,
+        "rho": rho_sensitivity,
+        "rho_r": rho_r,
+        "theta": theta,
+    }
+    
+def cross_gamma(spots, i, j, bump_pct=1e-4):
+    up_i  = spots.copy(); up_i[i] *= 1 + bump_pct
+    up_j  = spots.copy(); up_j[j] *= 1 + bump_pct
+    up_ij = up_i.copy();  up_ij[j] *= 1 + bump_pct
+
+    p_ij  = price_cvc(up_ij, vols, rho, strike, weights, T, curve, n_paths)
+    p_i   = price_cvc(up_i,  vols, rho, strike, weights, T, curve, n_paths)
+    p_j   = price_cvc(up_j,  vols, rho, strike, weights, T, curve, n_paths)
+    return (p_ij - p_i - p_j + base) / ((spots[i]*spots[j])*bump_pct**2)
+    
