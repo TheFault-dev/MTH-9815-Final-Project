@@ -11,18 +11,41 @@ def zero_rate(T, curve):
 def discount_factor(T, curve):
     return np.exp(-zero_rate(T, curve) * T)
 
-def simulate_terminal(spots, vols, rho, T, r, n_paths, seed=None):
+def simulate_terminal(spots, vols, corr, T, r, n_paths, seed=None):
+    """
+    corr : either a scalar 'rho' (equal-corr model)   or
+           a full NxN positive-definite correlation matrix.
+    """
+    spots   = np.asarray(spots, dtype=float)
+    vols    = np.asarray(vols,  dtype=float)
+    N       = spots.size
+
+    if np.isscalar(corr):                         # single-rho ⇒ homogeneous matrix
+        rho       = float(corr)
+        corr_mat  = np.full((N, N), rho)
+        np.fill_diagonal(corr_mat, 1.0)
+    else:
+        corr_mat  = np.asarray(corr, dtype=float)
+        assert corr_mat.shape == (N, N), "corr matrix dimension mismatch"
+
+    L  = np.linalg.cholesky(corr_mat)             # Cholesky for N-variate normals
     rng = np.random.default_rng(seed)
-    z = rng.standard_normal((n_paths, 2))
-    z[:, 1] = rho * z[:, 0] + np.sqrt(1 - rho ** 2) * z[:, 1]
-    drift = (r - 0.5 * vols ** 2) * T
+    z   = rng.standard_normal((n_paths, N)) @ L.T
+
+    drift     = (r - 0.5 * vols**2) * T
     diffusion = vols * np.sqrt(T) * z
-    return spots * np.exp(drift + diffusion)
+    return spots * np.exp(drift + diffusion)      # shape (n_paths, N)
+
 
 def cvc_payoff(paths, strike, weights):
-    basket = paths @ weights
-    return np.maximum(basket - strike, 0) - (np.maximum(paths - strike, 0) @ weights)
-
+    """
+    weights : array of length N that sums to 1 (usual CvC convention)
+    """
+    weights = np.asarray(weights, dtype=float)
+    basket  = paths @ weights
+    indiv   = np.maximum(paths - strike, 0) @ weights
+    return np.maximum(basket - strike, 0) - indiv
+    
 def price_cvc(spots, vols, rho, strike, weights, T, curve, n_paths=100_000, seed=None):
     r = zero_rate(T, curve)
     paths = simulate_terminal(np.array(spots), np.array(vols), rho, T, r, n_paths, seed)
@@ -146,3 +169,27 @@ for i, c in enumerate(cases, 1):
     print(f"Implied ρ      : {implied_rho:.4f}")
     for g, v in greeks.items():
         print(g, v)
+        
+# market price observed on the tape
+p_mkt = 1.27        # dollars
+
+# inputs (4-name equally-weighted basket)
+spots   = [ 95, 103, 88, 110 ]
+vols    = [ .21, .25, .19, .23 ]
+weights = np.full(4, 0.25)
+strike  = 100
+T       = 0.75                      # 9-month maturity
+curve   = [(0.0, 0.031), (1.0, 0.030)]
+
+rho_star = implied_corr(
+    market_price = p_mkt,
+    spots   = spots,
+    vols    = vols,
+    strike  = strike,
+    weights = weights,
+    T       = T,
+    curve   = curve,
+    n_paths = 150_000                # raise for production
+)
+
+print(f"Implied average pairwise correlation = {rho_star:.4f}")
