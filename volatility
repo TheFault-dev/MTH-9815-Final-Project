@@ -1,0 +1,207 @@
+import pandas as pd
+import numpy as np
+
+def get_constant_maturity_iv(tickers, start_date, end_date, maturity=30/365.25):
+    """
+    Generates a time series of constant maturity ATM implied volatility for multiple tickers.
+
+    Args:
+        tickers (list): List of stock tickers.
+        start_date (str): Start date in 'YYYY-MM-DD' format.
+        end_date (str): End date in 'YYYY-MM-DD' format.
+        maturity (float): Desired constant maturity in years (e.g., 30 days = 30/365.25).
+
+    Returns:
+        pd.DataFrame: A DataFrame with dates as the index and IV time series as columns.
+    """
+    dates = pd.to_datetime(pd.date_range(start_date, end_date, freq='B'))
+    all_ivs = {}
+
+    for ticker in tickers:
+        ticker_ivs = []
+        for date in dates:
+            try:
+                surface = get_iv_surface(ticker, date) # User's provided function
+                expiries = surface['Expiry'].values
+                atm_vols = surface['1.0'].values
+                
+                # Linear interpolation to find the constant maturity IV
+                constant_iv = np.interp(maturity, expiries, atm_vols)
+                ticker_ivs.append(constant_iv)
+            except Exception as e:
+                ticker_ivs.append(np.nan) # Handle cases where data is not available
+        all_ivs[ticker] = ticker_ivs
+        
+    df_iv = pd.DataFrame(all_ivs, index=dates)
+    df_iv.dropna(how='all', inplace=True)
+    return df_iv
+
+# Example Usage:
+# spy_components = spy_weights['CMDB Ticker'].tolist()
+# iv_timeseries = get_constant_maturity_iv(spy_components, '2022-01-01', '2023-12-31')
+
+
+def analyze_iv_comovement(df_iv, benchmark_ticker, stress_threshold=0.02):
+    """
+    Analyzes the co-movement of implied volatilities against a benchmark.
+
+    Args:
+        df_iv (pd.DataFrame): Time series of implied volatilities.
+        benchmark_ticker (str): The ticker to use as the benchmark (e.g., 'SPY-US').
+        stress_threshold (float): The daily percentage drop in benchmark to define a stress day.
+
+    Returns:
+        dict: A dictionary containing correlation and beta matrices for all, stress, and regular periods.
+    """
+    iv_returns = df_iv.pct_change().dropna()
+    benchmark_returns = iv_returns[benchmark_ticker]
+    
+    # Identify stress periods
+    stress_days = benchmark_returns < -stress_threshold
+    regular_days = ~stress_days
+
+    # Calculate correlation
+    corr_all = iv_returns.corr()
+    corr_stress = iv_returns[stress_days].corr()
+    corr_regular = iv_returns[regular_days].corr()
+
+    # Calculate scaling effect (beta)
+    betas = iv_returns.apply(lambda x: np.polyfit(benchmark_returns, x, 1)[0])
+    
+    return {
+        "correlation_all": corr_all,
+        "correlation_stress": corr_stress,
+        "correlation_regular": corr_regular,
+        "scaling_betas": betas
+    }
+
+# Example Usage:
+# comovement_results = analyze_iv_comovement(iv_timeseries, 'SPY-US')
+# print("Scaling Betas:\n", comovement_results['scaling_betas'])
+
+
+from arch import arch_model
+
+def calculate_vol_of_vol(df_iv):
+    """
+    Calculates the volatility of implied volatility using three different methods.
+
+    Args:
+        df_iv (pd.DataFrame): Time series of implied volatilities.
+
+    Returns:
+        dict: A dictionary of DataFrames for each vol-of-vol calculation method.
+    """
+    iv_returns = df_iv.pct_change().dropna()
+    
+    # 1. 21-Day Rolling Window
+    vol_rolling = iv_returns.rolling(window=21).std() * np.sqrt(252)
+
+    # 2. EWMA
+    vol_ewma = iv_returns.ewm(span=21, adjust=False).std() * np.sqrt(252)
+    
+    # 3. EGARCH(1,1)
+    def fit_egarch(series):
+        model = arch_model(series * 100, p=1, o=1, q=1, vol='EGARCH')
+        res = model.fit(disp='off')
+        return res.conditional_volatility / 100
+        
+    vol_egarch = iv_returns.apply(fit_egarch, axis=0) * np.sqrt(252)
+
+    return {
+        "rolling_21d": vol_rolling,
+        "ewma_21d": vol_ewma,
+        "egarch_1_1": vol_egarch
+    }
+
+# Example Usage:
+# vol_of_vol_results = calculate_vol_of_vol(iv_timeseries)
+# print("EWMA Vol of Vol:\n", vol_of_vol_results['ewma_21d'].tail())
+
+
+
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import make_pipeline
+
+def verify_power_law_decay(ticker, valuation_date):
+    """
+    Fits a power law to the IV term structure using L2 regularized regression.
+    The model is IV = c + b1*T^(-0.5) + b2*T^(-1.0), fit via log-log regression.
+
+    Args:
+        ticker (str): The stock ticker.
+        valuation_date (str): The valuation date 'YYYY-MM-DD'.
+
+    Returns:
+        dict: A dictionary with the regression model and its parameters.
+    """
+    surface = get_iv_surface(ticker, pd.to_datetime(valuation_date))
+    surface = surface.loc[surface['Expiry'] > 0]
+    
+    X = np.log(surface[['Expiry']].values)
+    y = np.log(surface['1.0'].values)
+    
+    # Using Ridge (L2 regularization) on a log-log plot to find the power
+    model = make_pipeline(PolynomialFeatures(1), Ridge(alpha=1.0))
+    model.fit(X, y)
+    
+    # The coefficient of the log(T) term is the power 'alpha'
+    # log(IV) = log(k) + alpha * log(T)
+    alpha = model.named_steps['ridge'].coef_[1]
+    
+    return {
+        "model": model,
+        "power_law_exponent (alpha)": alpha
+    }
+
+# Example Usage:
+# power_law_fit = verify_power_law_decay('AAPL-UQ', '2023-06-30')
+# print(f"Fitted Power Law Exponent: {power_law_fit['power_law_exponent (alpha)']:.4f}")
+
+
+
+def backtest_beta_hedging(portfolio_tickers, hedge_instrument, df_iv, betas):
+    """
+    Runs a simple backtest for a beta-weighted Vega hedge.
+
+    Args:
+        portfolio_tickers (list): List of tickers in the long portfolio.
+        hedge_instrument (str): The ticker for the hedging instrument (e.g., 'SPY-US').
+        df_iv (pd.DataFrame): Time series of implied volatilities.
+        betas (pd.Series): Series of scaling betas against the hedge instrument.
+
+    Returns:
+        pd.DataFrame: A DataFrame showing the unhedged vs. hedged portfolio IV changes.
+    """
+    iv_returns = df_iv.pct_change().dropna()
+
+    # Assume an equally-weighted portfolio (long 1 unit of IV in each stock)
+    portfolio_iv_returns = iv_returns[portfolio_tickers].mean(axis=1)
+
+    # Calculate the portfolio's aggregate beta
+    portfolio_beta = betas[portfolio_tickers].mean()
+    
+    # The optimal hedge ratio is the portfolio's beta
+    # We short 'portfolio_beta' units of the hedge instrument's IV
+    hedge_iv_returns = portfolio_beta * iv_returns[hedge_instrument]
+    
+    # Calculate hedged portfolio returns
+    hedged_portfolio_iv_returns = portfolio_iv_returns - hedge_iv_returns
+    
+    # Create results DataFrame
+    results = pd.DataFrame({
+        'unhedged_iv_change': portfolio_iv_returns,
+        'hedged_iv_change': hedged_portfolio_iv_returns
+    })
+    
+    print(f"Unhedged Volatility: {results['unhedged_iv_change'].std() * 100:.4f}%")
+    print(f"Hedged Volatility:   {results['hedged_iv_change'].std() * 100:.4f}%")
+    
+    return results
+
+# Example Usage:
+# Assume we ran Module 2 and got the betas
+# betas = comovement_results['scaling_betas']
+# my_portfolio = ['AAPL-UQ', 'MSFT-US', 'NVDA-US'] # Our proxy portfolio
+# hedge_results = backtest_beta_hedging(my_portfolio, 'SPY-US', iv_timeseries, betas)
