@@ -209,72 +209,40 @@ def backtest_beta_hedging(portfolio_tickers, hedge_instrument, df_iv, betas):
 
 import pandas as pd
 import numpy as np
-import warnings
-
-# Ignore potential PyTables performance warnings for this use case
-warnings.filterwarnings('ignore', category=pd.io.pytables.PerformanceWarning)
 
 def store_vol_surfaces_to_hdf(spy_weights_df, start_date, end_date, output_path='vol_surfaces.h5'):
     """
-    Fetches IV surfaces for top tickers and stores them in an HDF5 file.
-
-    Args:
-        spy_weights_df (pd.DataFrame): DataFrame with 'CMDB Ticker' and 'ID().WEIGHTS'.
-        start_date (str): Start date 'YYYY-MM-DD'.
-        end_date (str): End date 'YYYY-MM-DD'.
-        output_path (str): Path for the output HDF5 file.
+    Fetches and stores IV surfaces in an HDF5 file with string-formatted columns.
     """
-    # Select top 50 tickers by weight and add benchmarks
     top_50_tickers = spy_weights_df.nlargest(50, 'ID().WEIGHTS')['CMDB Ticker'].tolist()
-    benchmarks = ['SPY-UP', 'SPX']
-    all_tickers = list(set(top_50_tickers + benchmarks))
-
+    all_tickers = list(set(top_50_tickers + ['SPY-UP', 'SPX']))
     dates = pd.to_datetime(pd.date_range(start_date, end_date, freq='B'))
-    
-    print(f"Processing {len(all_tickers)} tickers over {len(dates)} business days...")
 
     with pd.HDFStore(output_path, mode='w', complevel=9, complib='blosc') as store:
         for ticker in all_tickers:
             for date in dates:
-                try:
-                    # This is your provided function to get the raw surface
-                    surface_df = get_iv_surface(ticker, date)
-                    
-                    # Create a safe key for HDF5 storage
-                    key = f'/{ticker.replace("-", "_").replace(".", "")}/{date.strftime("d%Y%m%d")}'
-                    
-                    store.put(key, surface_df, format='table', data_columns=True)
-                    
-                    # Store spot and valuation date as attributes for easy access
-                    store.get_storer(key).attrs.metadata = {
-                        'spot': surface_df.spot,
-                        'valuation_date': surface_df.valuation_date
-                    }
-                except Exception as e:
-                    # This allows the process to continue if data for one day is missing
-                    print(f"Could not retrieve data for {ticker} on {date.date()}: {e}")
-                    continue
-    
-    print(f"Data successfully stored in {output_path}")
+                # This is your provided function to get the raw surface
+                surface_df = get_iv_surface(ticker, date)
 
-# Example Usage:
-# Assuming 'SPY_weights' is your DataFrame with weights
-# store_vol_surfaces_to_hdf(SPY_weights, '2022-01-01', '2023-12-31')
-
+                # Convert numeric columns to valid string names (e.g., 1.0 -> 'm_1_0')
+                rename_map = {c: f"m_{str(c).replace('.', '_')}" for c in surface_df.columns if isinstance(c, (int, float))}
+                surface_df.rename(columns=rename_map, inplace=True)
+                
+                # Create a safe key for HDF5 storage
+                key = f'/{ticker.replace("-", "_").replace(".", "")}/{date.strftime("d%Y%m%d")}'
+                
+                # Store the DataFrame
+                store.put(key, surface_df, format='table')
+                
+                # Store metadata
+                store.get_storer(key).attrs.metadata = {
+                    'spot': surface_df.spot,
+                    'valuation_date': surface_df.valuation_date
+                }
 
 def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vol_surfaces.h5', maturity=30/365.25):
     """
-    Calculates implied volatility returns based on the fixed-strike method.
-
-    Args:
-        tickers (list): List of tickers to process.
-        start_date (str): Start date 'YYYY-MM-DD'.
-        end_date (str): End date 'YYYY-MM-DD'.
-        db_path (str): Path to the HDF5 database of surfaces.
-        maturity (float): Desired constant maturity in years.
-
-    Returns:
-        pd.DataFrame: A DataFrame of daily fixed-strike IV changes.
+    Calculates fixed-strike IV changes using the corrected HDF5 file.
     """
     dates = pd.to_datetime(pd.date_range(start_date, end_date, freq='B'))
     iv_changes = {}
@@ -288,40 +256,37 @@ def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vo
 
             for date in dates:
                 key = f'/{ticker_key_name}/{date.strftime("d%Y%m%d")}'
-                if key not in store:
+                if key not in store.keys():
                     daily_changes.append(np.nan)
                     continue
 
-                # 1. Load today's surface and metadata
                 surface = store[key]
                 metadata = store.get_storer(key).attrs.metadata
                 spot_today = metadata['spot']
                 
-                # 2. Interpolate to get constant maturity IVs for today's moneyness grid
+                iv_cols = [c for c in surface.columns if c.startswith('m_')]
+                moneyness_levels = [float(c.replace('m_', '').replace('_', '.')) for c in iv_cols]
+                
+                # Sort them to ensure they are in ascending order for interpolation
+                sorted_indices = np.argsort(moneyness_levels)
+                moneyness_levels = np.array(moneyness_levels)[sorted_indices]
+                iv_surface_values = surface[np.array(iv_cols)[sorted_indices]].values
+                
                 expiries = surface['Expiry'].values
-                iv_surface_values = surface.drop(columns=['Expiry']).values
                 constant_maturity_vols = np.apply_along_axis(
                     lambda vol_col: np.interp(maturity, expiries, vol_col), 0, iv_surface_values
                 )
-                moneyness_levels = [float(c) for c in surface.columns if c != 'Expiry']
 
-                # 3. If we have data from a previous day, calculate the change
                 if not np.isnan(prev_spot):
-                    # Find moneyness of yesterday's strike on today's surface
                     moneyness_of_prev_strike = prev_spot / spot_today
-                    
-                    # Interpolate along the moneyness axis to get IV of previous strike
                     iv_of_prev_strike_today = np.interp(
                         moneyness_of_prev_strike, moneyness_levels, constant_maturity_vols
                     )
-                    
                     change = iv_of_prev_strike_today - prev_atm_iv
                     daily_changes.append(change)
                 else:
-                    daily_changes.append(np.nan) # No change for the first day
+                    daily_changes.append(np.nan)
 
-                # 4. Record today's ATM IV and spot for the next iteration
-                # ATM (moneyness=1.0) is already on the constant maturity slice
                 current_atm_iv = np.interp(1.0, moneyness_levels, constant_maturity_vols)
                 prev_atm_iv = current_atm_iv
                 prev_spot = spot_today
@@ -330,12 +295,3 @@ def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vo
 
     results_df = pd.DataFrame(iv_changes, index=dates)
     return results_df.dropna(how='all')
-
-# Example Usage:
-# top_50_tickers = SPY_weights.nlargest(50, 'ID().WEIGHTS')['CMDB Ticker'].tolist()
-# benchmarks = ['SPY-UP', 'SPX']
-# all_tickers = list(set(top_50_tickers + benchmarks))
-#
-# iv_change_series = calculate_fixed_strike_iv_changes(all_tickers, '2022-01-01', '2023-12-31')
-# print(iv_change_series.head())
-
