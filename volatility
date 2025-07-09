@@ -351,3 +351,140 @@ def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vo
 
     results_df = pd.DataFrame(iv_changes, index=dates)
     return results_df.dropna(how='all')
+
+# 9:30
+import pandas as pd
+
+# The path to the HDF5 file you already created
+db_path = 'vol_surfaces.h5'
+
+print(f"Inspecting structure of: {db_path}\n" + "="*40)
+
+with pd.HDFStore(db_path, mode='r') as store:
+    # Get all the keys (paths) in the file
+    all_keys = store.keys()
+    
+    # Print the first 20 keys to see the structure
+    print("First 20 keys in the file:")
+    for key in all_keys[:20]:
+        print(key)
+        
+    print(f"\nTotal items in file: {len(all_keys)}")
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Step 1: Load All Data for One Stock into Memory ---
+
+# Choose a single stock to process for this test
+ticker_to_process = 'AAPL-UQ' 
+ticker_key_name = ticker_to_process.replace("-", "_").replace(".", "")
+maturity_in_years = 30 / 365.25
+
+# This dictionary will hold all the data we load from the file
+# Keys will be dates, values will be another dict: {'surface': df, 'spot': spot_price}
+stock_data = {}
+
+# Open the file ONCE to pull all data for our chosen stock
+with pd.HDFStore(db_path, mode='r') as store:
+    for key in store.keys():
+        if f'/{ticker_key_name}/' in key:
+            # Extract the date from the key string
+            date_str = key.split('/')[-1].replace('d', '')
+            date = pd.to_datetime(date_str, format='%Y%m%d')
+            
+            # Load the surface and its metadata into our dictionary
+            surface_df = store[key]
+            metadata = store.get_storer(key).attrs.metadata
+            stock_data[date] = {'surface': surface_df, 'spot': metadata['spot']}
+
+# Convert the dictionary into a DataFrame for easy processing
+df = pd.DataFrame.from_dict(stock_data, orient='index').sort_index()
+
+
+# --- Step 2: Calculate the IV Change Series using Pandas ---
+
+# Create columns for the PREVIOUS day's data using .shift()
+df['prev_spot'] = df['spot'].shift(1)
+df['prev_surface'] = df['surface'].shift(1)
+
+# This function calculates the change for a single row (one day)
+def calculate_iv_change_for_row(row):
+    # Skip the first row or any day missing previous data
+    if pd.isna(row['prev_spot']) or row['prev_surface'] is None:
+        return np.nan
+
+    # --- Get previous day's ATM IV ---
+    prev_surface = row['prev_surface']
+    
+    # Because of the 'm_x_y' format, we must parse them back to numbers
+    iv_cols = [c for c in prev_surface.columns if c.startswith('m_')]
+    moneyness_levels = [float(c.replace('m_', '').replace('_', '.')) for c in iv_cols]
+    
+    # The string format requires sorting to ensure interpolation works correctly
+    sorted_indices = np.argsort(moneyness_levels)
+    moneyness_levels = np.array(moneyness_levels)[sorted_indices]
+    prev_iv_surface_values = prev_surface[np.array(iv_cols)[sorted_indices]].values
+    
+    # Interpolate to get the 30-day constant maturity slice
+    prev_expiries = prev_surface['Expiry'].values
+    prev_constant_maturity_vols = np.apply_along_axis(
+        lambda vol_col: np.interp(maturity_in_years, prev_expiries, vol_col), 0, prev_iv_surface_values
+    )
+    
+    # Find the ATM IV from the previous day
+    prev_atm_iv = np.interp(1.0, moneyness_levels, prev_constant_maturity_vols)
+
+    # --- Get today's IV for yesterday's strike ---
+    today_surface = row['surface']
+    today_spot = row['spot']
+    
+    # Repeat the parsing for today's surface
+    iv_cols = [c for c in today_surface.columns if c.startswith('m_')]
+    moneyness_levels = [float(c.replace('m_', '').replace('_', '.')) for c in iv_cols]
+    sorted_indices = np.argsort(moneyness_levels)
+    moneyness_levels = np.array(moneyness_levels)[sorted_indices]
+    today_iv_surface_values = today_surface[np.array(iv_cols)[sorted_indices]].values
+
+    today_expiries = today_surface['Expiry'].values
+    today_constant_maturity_vols = np.apply_along_axis(
+        lambda vol_col: np.interp(maturity_in_years, today_expiries, vol_col), 0, today_iv_surface_values
+    )
+    
+    # Calculate moneyness of yesterday's strike on today's surface
+    moneyness_of_prev_strike = row['prev_spot'] / today_spot
+    
+    # Interpolate to find the IV
+    iv_of_prev_strike_today = np.interp(moneyness_of_prev_strike, moneyness_levels, today_constant_maturity_vols)
+    
+    # The final result for the day
+    return iv_of_prev_strike_today - prev_atm_iv
+
+# Apply the function to every row to calculate the series
+df['iv_change'] = df.apply(calculate_iv_change_for_row, axis=1)
+
+
+# --- Step 3: Visualize the Resulting Series ---
+
+plt.style.use('seaborn-v0_8-grid')
+fig, ax = plt.subplots(figsize=(15, 7))
+
+df['iv_change'].plot(ax=ax, label='Daily IV Change', marker='.', linestyle='-')
+
+ax.set_title(f'Calculated Fixed-Strike IV Change Series for {ticker_to_process}', fontsize=16)
+ax.set_xlabel('Date', fontsize=12)
+ax.set_ylabel('Absolute Change in Implied Volatility', fontsize=12)
+ax.axhline(0, color='red', linestyle='--', lw=1)
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+# Display the head and tail of the final data
+print(f"\nFinal DataFrame with calculated changes for {ticker_to_process}:\n" + "="*60)
+print(df[['spot', 'prev_spot', 'iv_change']].dropna().head())
+print("...")
+print(df[['spot', 'prev_spot', 'iv_change']].dropna().tail())
+
+
+
