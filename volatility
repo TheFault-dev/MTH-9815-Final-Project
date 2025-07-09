@@ -529,23 +529,33 @@ def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vo
         return iv_of_prev_strike_today - prev_atm_iv
 
     with pd.HDFStore(db_path, mode='r') as store:
+        existing_tickers_in_file = [node._v_name for node in store.root]
+        
         for ticker in tickers:
             ticker_key_name = ticker.replace("-", "_").replace(".", "")
+            
+            if ticker_key_name not in existing_tickers_in_file:
+                continue
+
             stock_data = {}
-            for key in store.keys():
-                if f'/{ticker_key_name}/' in key:
-                    date_str = key.split('/')[-1].replace('d', '')
-                    date = pd.to_datetime(date_str, format='%Y%m%d')
-                    surface_df = store[key]
-                    metadata = store.get_storer(key).attrs.metadata
-                    stock_data[date] = {'surface': surface_df, 'spot': metadata['spot']}
+            ticker_group = getattr(store.root, ticker_key_name)
+            
+            for date_node in ticker_group:
+                date_str = date_node.name.replace('d', '')
+                date = pd.to_datetime(date_str, format='%Y%m%d')
+                
+                surface_df = date_node.read()
+                metadata = date_node.attrs.metadata
+                stock_data[date] = {'surface': surface_df, 'spot': metadata['spot']}
             
             if not stock_data:
                 continue
 
             df = pd.DataFrame.from_dict(stock_data, orient='index').sort_index()
-            
             df = df.loc[start_date:end_date]
+            
+            if df.empty:
+                continue
 
             df['prev_spot'] = df['spot'].shift(1)
             df['prev_surface'] = df['surface'].shift(1)
