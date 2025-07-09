@@ -1,4 +1,4 @@
-import pandas as pd
+#import pandas as pd
 import numpy as np
 
 def get_constant_maturity_iv(tickers, start_date, end_date, maturity=30/365.25):
@@ -561,4 +561,53 @@ def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vo
 
     final_df = pd.DataFrame(all_results)
     return final_df
+
+# 10:20
+
+import pandas as pd
+
+# --- Configuration ---
+db_path = 'vol_surfaces.h5'
+date_to_check = '2023-01-03' # Pick any date that exists in your dataset
+ticker1 = 'AAPL-UQ'
+ticker2 = 'MSFT-US' # Pick two different tickers from your top 50 list
+
+# --- Debugging Code ---
+print("--- HDF5 Data Integrity Check ---")
+
+# Construct the precise keys for the HDF5 file
+key1 = f"/{ticker1.replace('-', '_').replace('.', '')}/{pd.to_datetime(date_to_check).strftime('d%Y%m%d')}"
+key2 = f"/{ticker2.replace('-', '_').replace('.', '')}/{pd.to_datetime(date_to_check).strftime('d%Y%m%d')}"
+
+with pd.HDFStore(db_path, mode='r') as store:
+    # Verify both keys actually exist in the file
+    if key1 not in store or key2 not in store:
+        print(f"Error: A key for date {date_to_check} is missing for one of the tickers.")
+    else:
+        # Load the data and metadata for both tickers
+        df1 = store.get(key1)
+        meta1 = store.get_storer(key1).attrs.metadata
+        
+        df2 = store.get(key2)
+        meta2 = store.get_storer(key2).attrs.metadata
+
+        # Print the spot price and head of each DataFrame
+        print(f"\nData for {ticker1} on {date_to_check}:")
+        print(f"Spot Price: {meta1['spot']}")
+        print(df1.head(3))
+        
+        print(f"\nData for {ticker2} on {date_to_check}:")
+        print(f"Spot Price: {meta2['spot']}")
+        print(df2.head(3))
+
+        # Programmatically check if the two DataFrames are identical
+        are_they_equal = df1.equals(df2)
+        
+        print("\n--- Verification Result ---")
+        if are_they_equal:
+            print("🔴 CRITICAL FLAW CONFIRMED: The data saved for both tickers is identical.")
+        else:
+            print("🟢 The data for the two tickers is different, as expected.")
+
+
 
