@@ -491,24 +491,9 @@ print(df[['spot', 'prev_spot', 'iv_change']].dropna().tail())
 import pandas as pd
 import numpy as np
 
-def calculate_fixed_strike_iv_changes_optimized(ticker_to_process, db_path, maturity_in_years=30/365.25):
-
-    ticker_key_name = ticker_to_process.replace("-", "_").replace(".", "")
-    stock_data = {}
-
-    with pd.HDFStore(db_path, mode='r') as store:
-        for key in store.keys():
-            if f'/{ticker_key_name}/' in key:
-                date_str = key.split('/')[-1].replace('d', '')
-                date = pd.to_datetime(date_str, format='%Y%m%d')
-                surface_df = store[key]
-                metadata = store.get_storer(key).attrs.metadata
-                stock_data[date] = {'surface': surface_df, 'spot': metadata['spot']}
-
-    df = pd.DataFrame.from_dict(stock_data, orient='index').sort_index()
-
-    df['prev_spot'] = df['spot'].shift(1)
-    df['prev_surface'] = df['surface'].shift(1)
+def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vol_surfaces.h5', maturity_in_years=30/365.25):
+    
+    all_results = {}
 
     def calculate_iv_change_for_row(row):
         if pd.isna(row['prev_spot']) or row['prev_surface'] is None:
@@ -529,7 +514,7 @@ def calculate_fixed_strike_iv_changes_optimized(ticker_to_process, db_path, matu
         today_surface = row['surface']
         today_spot = row['spot']
         iv_cols = [c for c in today_surface.columns if c.startswith('m_')]
-        moneyness_levels = [float(c.replace('m_', '').replace('_', '..')) for c in iv_cols]
+        moneyness_levels = [float(c.replace('m_', '').replace('_', '.')) for c in iv_cols]
         sorted_indices = np.argsort(moneyness_levels)
         moneyness_levels = np.array(moneyness_levels)[sorted_indices]
         today_iv_surface_values = today_surface[np.array(iv_cols)[sorted_indices]].values
@@ -543,13 +528,29 @@ def calculate_fixed_strike_iv_changes_optimized(ticker_to_process, db_path, matu
 
         return iv_of_prev_strike_today - prev_atm_iv
 
-    df['iv_change'] = df.apply(calculate_iv_change_for_row, axis=1)
+    with pd.HDFStore(db_path, mode='r') as store:
+        for ticker in tickers:
+            ticker_key_name = ticker.replace("-", "_").replace(".", "")
+            stock_data = {}
+            for key in store.keys():
+                if f'/{ticker_key_name}/' in key:
+                    date_str = key.split('/')[-1].replace('d', '')
+                    date = pd.to_datetime(date_str, format='%Y%m%d')
+                    surface_df = store[key]
+                    metadata = store.get_storer(key).attrs.metadata
+                    stock_data[date] = {'surface': surface_df, 'spot': metadata['spot']}
+            
+            if not stock_data:
+                continue
 
-    return df[['iv_change']]
+            df = pd.DataFrame.from_dict(stock_data, orient='index').sort_index()
+            
+            df = df.loc[start_date:end_date]
 
-# Example usage:
-# db_path = 'vol_surfaces.h5'
-# aapl_iv_changes = calculate_fixed_strike_iv_changes_optimized('AAPL-UQ', db_path)
-# print(aapl_iv_changes.head())
+            df['prev_spot'] = df['spot'].shift(1)
+            df['prev_surface'] = df['surface'].shift(1)
+            
+            all_results[ticker] = df.apply(calculate_iv_change_for_row, axis=1)
 
-
+    final_df = pd.DataFrame(all_results)
+    return final_df
