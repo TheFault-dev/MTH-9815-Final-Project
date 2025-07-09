@@ -610,4 +610,35 @@ with pd.HDFStore(db_path, mode='r') as store:
             print("🟢 The data for the two tickers is different, as expected.")
 
 
+# 10:30
+
+import pandas as pd
+import numpy as np
+
+def store_vol_surfaces_to_hdf(spy_weights_df, start_date, end_date, output_path='vol_surfaces.h5'):
+    
+    top_50_tickers = spy_weights_df.nlargest(50, 'ID().WEIGHTS')['CMDB Ticker'].tolist()
+    all_tickers = list(set(top_50_tickers + ['SPY-UP', 'SPX']))
+    dates = pd.to_datetime(pd.date_range(start_date, end_date, freq='B'))
+
+    with pd.HDFStore(output_path, mode='w', complevel=9, complib='blosc') as store:
+        for ticker in all_tickers:
+            for date in dates:
+                surface_df = get_iv_surface(ticker, date)
+
+                if surface_df is not None:
+                    rename_map = {c: f"m_{str(c).replace('.', '_')}" for c in surface_df.columns if isinstance(c, (int, float))}
+                    
+                    # --- THE FIX: Avoid inplace=True and reassign the DataFrame ---
+                    surface_df = surface_df.rename(columns=rename_map)
+                    
+                    key = f'/{ticker.replace("-", "_").replace(".", "")}/{date.strftime("d%Y%m%d")}'
+                    
+                    store.put(key, surface_df, format='table')
+                    
+                    store.get_storer(key).attrs.metadata = {
+                        'spot': surface_df.spot,
+                        'valuation_date': surface_df.valuation_date
+                    }
+
 
