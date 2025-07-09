@@ -295,3 +295,59 @@ def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vo
 
     results_df = pd.DataFrame(iv_changes, index=dates)
     return results_df.dropna(how='all')
+
+def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vol_surfaces.h5', maturity=30/365.25):
+    """
+    Calculates fixed-strike IV changes using the corrected HDF5 file.
+    """
+    dates = pd.to_datetime(pd.date_range(start_date, end_date, freq='B'))
+    iv_changes = {}
+
+    with pd.HDFStore(db_path, mode='r') as store:
+        for ticker in tickers:
+            ticker_key_name = ticker.replace("-", "_").replace(".", "")
+            prev_atm_iv = np.nan
+            prev_spot = np.nan
+            daily_changes = []
+
+            for date in dates:
+                key = f'/{ticker_key_name}/{date.strftime("d%Y%m%d")}'
+                if key not in store.keys():
+                    daily_changes.append(np.nan)
+                    continue
+
+                surface = store[key]
+                metadata = store.get_storer(key).attrs.metadata
+                spot_today = metadata['spot']
+                
+                iv_cols = [c for c in surface.columns if c.startswith('m_')]
+                moneyness_levels = [float(c.replace('m_', '').replace('_', '.')) for c in iv_cols]
+                
+                # Sort them to ensure they are in ascending order for interpolation
+                sorted_indices = np.argsort(moneyness_levels)
+                moneyness_levels = np.array(moneyness_levels)[sorted_indices]
+                iv_surface_values = surface[np.array(iv_cols)[sorted_indices]].values
+                
+                expiries = surface['Expiry'].values
+                constant_maturity_vols = np.apply_along_axis(
+                    lambda vol_col: np.interp(maturity, expiries, vol_col), 0, iv_surface_values
+                )
+
+                if not np.isnan(prev_spot):
+                    moneyness_of_prev_strike = prev_spot / spot_today
+                    iv_of_prev_strike_today = np.interp(
+                        moneyness_of_prev_strike, moneyness_levels, constant_maturity_vols
+                    )
+                    change = iv_of_prev_strike_today - prev_atm_iv
+                    daily_changes.append(change)
+                else:
+                    daily_changes.append(np.nan)
+
+                current_atm_iv = np.interp(1.0, moneyness_levels, constant_maturity_vols)
+                prev_atm_iv = current_atm_iv
+                prev_spot = spot_today
+
+            iv_changes[ticker] = daily_changes
+
+    results_df = pd.DataFrame(iv_changes, index=dates)
+    return results_df.dropna(how='all')
