@@ -1,4 +1,4 @@
-#import pandas as pd
+import pandas as pd
 import numpy as np
 
 def get_constant_maturity_iv(tickers, start_date, end_date, maturity=30/365.25):
@@ -641,4 +641,160 @@ def store_vol_surfaces_to_hdf(spy_weights_df, start_date, end_date, output_path=
                         'valuation_date': surface_df.valuation_date
                     }
 
+# 16:30
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plot_iv_series(iv_change_series, benchmarks):
+    plt.style.use('seaborn-v0_8-grid')
+    fig, ax = plt.subplots(figsize=(18, 9))
+
+    for ticker in iv_change_series.columns:
+        if ticker in benchmarks:
+            ax.plot(iv_change_series.index, iv_change_series[ticker], lw=2.0, label=ticker)
+        else:
+            ax.plot(iv_change_series.index, iv_change_series[ticker], lw=0.7, linestyle='--')
+
+    ax.set_title('Implied Volatility Change Series', fontsize=16)
+    ax.set_xlabel('Date', fontsize=12)
+    ax.set_ylabel('Absolute Change in IV', fontsize=12)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+# Example Usage:
+# benchmarks = ['SPY-UP', 'SPX'] 
+# plot_iv_series(iv_change_series, benchmarks)
+
+
+import pandas as pd
+import numpy as np
+
+def calculate_dispersion_matrix(iv_change_series, benchmarks):
+    # Decision: We will use SPY-UP as the primary benchmark for this example analysis.
+    primary_benchmark = 'SPY-UP'
+    
+    betas = {}
+    cleaned_series = iv_change_series.dropna()
+    
+    y = cleaned_series[primary_benchmark]
+    
+    for ticker in cleaned_series.columns:
+        if ticker == primary_benchmark:
+            continue
+        x = cleaned_series[ticker]
+        beta = np.polyfit(y, x, 1)[0]
+        betas[ticker] = beta
+
+    beta_df = pd.DataFrame.from_dict(betas, orient='index', columns=['Beta_vs_' + primary_benchmark])
+    beta_df = beta_df.sort_values(by='Beta_vs_' + primary_benchmark, ascending=False)
+    
+    plt.figure(figsize=(10, 12))
+    sns.heatmap(beta_df, annot=True, cmap='coolwarm', fmt='.2f')
+    plt.title(f'Dispersion Beta vs. {primary_benchmark}', fontsize=16)
+    plt.show()
+    
+    return beta_df
+
+# Example Usage:
+# dispersion_betas = calculate_dispersion_matrix(iv_change_series, benchmarks)
+
+
+from statsmodels.tsa.stattools import adfuller
+
+def analyze_stationarity_and_drift(iv_change_series):
+    results = []
+    for ticker in iv_change_series.columns:
+        series = iv_change_series[ticker].dropna()
+        adf_result = adfuller(series)
+        
+        # Decision: 'Drift' is interpreted as the mean of the daily IV change series.
+        drift = series.mean() * 252 # Annualized drift
+        
+        results.append({
+            'Ticker': ticker,
+            'ADF_p_value': adf_result[1],
+            'Is_Stationary_at_5%': adf_result[1] < 0.05,
+            'Annualized_Drift': drift
+        })
+
+    results_df = pd.DataFrame(results).set_index('Ticker')
+    results_df = results_df.sort_values(by='Annualized_Drift', ascending=False)
+    return results_df
+
+# Example Usage:
+# stationarity_report = analyze_stationarity_and_drift(iv_change_series)
+# print(stationarity_report)
+
+
+from arch import arch_model
+
+def analyze_volatility_clustering(iv_change_series):
+    garch_results = []
+    for ticker in iv_change_series.columns:
+        series = iv_change_series[ticker].dropna() * 100
+        model = arch_model(series, vol='Garch', p=1, q=1, dist='ged')
+        res = model.fit(disp='off')
+        
+        garch_results.append({
+            'Ticker': ticker,
+            'alpha[1]': res.params['alpha[1]'],
+            'beta[1]': res.params['beta[1]'],
+            'alpha+beta': res.params['alpha[1]'] + res.params['beta[1]']
+        })
+
+    garch_df = pd.DataFrame(garch_results).set_index('Ticker').sort_values('alpha+beta', ascending=False)
+    print("--- GARCH Volatility Clustering Results ---")
+    print(garch_df.head(10))
+
+    corr_matrix = iv_change_series.corr()
+    
+    # Decision: Use seaborn's clustermap to automatically group similar stocks.
+    sns.clustermap(corr_matrix, cmap='viridis', annot=False, figsize=(14, 14))
+    plt.suptitle('Hierarchical Clustering of IV Change Correlation', y=1.02, fontsize=16)
+    plt.show()
+    
+    return garch_df, corr_matrix
+
+# Example Usage:
+# garch_report, correlation_matrix = analyze_volatility_clustering(iv_change_series)
+
+
+def vol_of_vol_predictive_model(iv_change_series, base_ticker, target_ticker):
+    base_series = iv_change_series[base_ticker].dropna() * 100
+    target_series = iv_change_series[target_ticker].dropna() * 100
+    
+    # Align the series
+    df = pd.DataFrame({'base': base_series, 'target': target_series}).dropna()
+
+    # Fit GARCH to both to get conditional vol series
+    base_garch = arch_model(df['base'], vol='Garch', p=1, q=1).fit(disp='off')
+    target_garch = arch_model(df['target'], vol='Garch', p=1, q=1).fit(disp='off')
+    
+    vols_df = pd.DataFrame({
+        'base_vol': base_garch.conditional_volatility,
+        'target_vol': target_garch.conditional_volatility
+    })
+    
+    # Predictive regression: Target Vol(t) = C + Beta * Base Vol(t)
+    y = vols_df['target_vol']
+    X = sm.add_constant(vols_df['base_vol']) # Using statsmodels for a clean summary
+    
+    model = sm.OLS(y, X).fit()
+    print(f"\n--- Predictive Model: {target_ticker} Vol vs. {base_ticker} Vol ---")
+    print(model.summary())
+    
+    # Visualize the relationship
+    sns.regplot(x='base_vol', y='target_vol', data=vols_df, line_kws={'color': 'red'})
+    plt.title(f'Conditional Volatility Relationship: {base_ticker} vs. {target_ticker}', fontsize=16)
+    plt.xlabel(f'{base_ticker} Conditional Volatility')
+    plt.ylabel(f'{target_ticker} Conditional Volatility')
+    plt.show()
+
+# Example Usage:
+# import statsmodels.api as sm
+# base_ticker = 'SPY-UP'
+# target_ticker = 'AAPL-UQ' # Choose any stock from your list
+# vol_of_vol_predictive_model(iv_change_series, base_ticker, target_ticker)
 
