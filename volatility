@@ -529,23 +529,20 @@ def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vo
         return iv_of_prev_strike_today - prev_atm_iv
 
     with pd.HDFStore(db_path, mode='r') as store:
-        existing_tickers_in_file = [node._v_name for node in store.root]
+        all_file_keys = store.keys()
         
         for ticker in tickers:
-            ticker_key_name = ticker.replace("-", "_").replace(".", "")
-            
-            if ticker_key_name not in existing_tickers_in_file:
-                continue
-
+            ticker_key_name = f"/{ticker.replace('-', '_').replace('.', '')}/"
             stock_data = {}
-            ticker_group = getattr(store.root, ticker_key_name)
-            
-            for date_node in ticker_group:
-                date_str = date_node.name.replace('d', '')
+
+            keys_for_ticker = [key for key in all_file_keys if key.startswith(ticker_key_name)]
+
+            for key in keys_for_ticker:
+                date_str = key.split('/')[-1].replace('d', '')
                 date = pd.to_datetime(date_str, format='%Y%m%d')
                 
-                surface_df = date_node.read()
-                metadata = date_node.attrs.metadata
+                surface_df = store.get(key)
+                metadata = store.get_storer(key).attrs.metadata
                 stock_data[date] = {'surface': surface_df, 'spot': metadata['spot']}
             
             if not stock_data:
@@ -564,3 +561,4 @@ def calculate_fixed_strike_iv_changes(tickers, start_date, end_date, db_path='vo
 
     final_df = pd.DataFrame(all_results)
     return final_df
+
