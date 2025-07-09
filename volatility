@@ -486,5 +486,70 @@ print(df[['spot', 'prev_spot', 'iv_change']].dropna().head())
 print("...")
 print(df[['spot', 'prev_spot', 'iv_change']].dropna().tail())
 
+# 9:45
+
+import pandas as pd
+import numpy as np
+
+def calculate_fixed_strike_iv_changes_optimized(ticker_to_process, db_path, maturity_in_years=30/365.25):
+
+    ticker_key_name = ticker_to_process.replace("-", "_").replace(".", "")
+    stock_data = {}
+
+    with pd.HDFStore(db_path, mode='r') as store:
+        for key in store.keys():
+            if f'/{ticker_key_name}/' in key:
+                date_str = key.split('/')[-1].replace('d', '')
+                date = pd.to_datetime(date_str, format='%Y%m%d')
+                surface_df = store[key]
+                metadata = store.get_storer(key).attrs.metadata
+                stock_data[date] = {'surface': surface_df, 'spot': metadata['spot']}
+
+    df = pd.DataFrame.from_dict(stock_data, orient='index').sort_index()
+
+    df['prev_spot'] = df['spot'].shift(1)
+    df['prev_surface'] = df['surface'].shift(1)
+
+    def calculate_iv_change_for_row(row):
+        if pd.isna(row['prev_spot']) or row['prev_surface'] is None:
+            return np.nan
+
+        prev_surface = row['prev_surface']
+        iv_cols = [c for c in prev_surface.columns if c.startswith('m_')]
+        moneyness_levels = [float(c.replace('m_', '').replace('_', '.')) for c in iv_cols]
+        sorted_indices = np.argsort(moneyness_levels)
+        moneyness_levels = np.array(moneyness_levels)[sorted_indices]
+        prev_iv_surface_values = prev_surface[np.array(iv_cols)[sorted_indices]].values
+        prev_expiries = prev_surface['Expiry'].values
+        prev_constant_maturity_vols = np.apply_along_axis(
+            lambda vol_col: np.interp(maturity_in_years, prev_expiries, vol_col), 0, prev_iv_surface_values
+        )
+        prev_atm_iv = np.interp(1.0, moneyness_levels, prev_constant_maturity_vols)
+
+        today_surface = row['surface']
+        today_spot = row['spot']
+        iv_cols = [c for c in today_surface.columns if c.startswith('m_')]
+        moneyness_levels = [float(c.replace('m_', '').replace('_', '..')) for c in iv_cols]
+        sorted_indices = np.argsort(moneyness_levels)
+        moneyness_levels = np.array(moneyness_levels)[sorted_indices]
+        today_iv_surface_values = today_surface[np.array(iv_cols)[sorted_indices]].values
+        today_expiries = today_surface['Expiry'].values
+        today_constant_maturity_vols = np.apply_along_axis(
+            lambda vol_col: np.interp(maturity_in_years, today_expiries, vol_col), 0, today_iv_surface_values
+        )
+
+        moneyness_of_prev_strike = row['prev_spot'] / today_spot
+        iv_of_prev_strike_today = np.interp(moneyness_of_prev_strike, moneyness_levels, today_constant_maturity_vols)
+
+        return iv_of_prev_strike_today - prev_atm_iv
+
+    df['iv_change'] = df.apply(calculate_iv_change_for_row, axis=1)
+
+    return df[['iv_change']]
+
+# Example usage:
+# db_path = 'vol_surfaces.h5'
+# aapl_iv_changes = calculate_fixed_strike_iv_changes_optimized('AAPL-UQ', db_path)
+# print(aapl_iv_changes.head())
 
 
