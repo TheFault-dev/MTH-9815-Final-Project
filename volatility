@@ -1,4 +1,4 @@
-import pandas as pd
+ import pandas as pd
 import numpy as np
 
 def get_constant_maturity_iv(tickers, start_date, end_date, maturity=30/365.25):
@@ -1010,6 +1010,8 @@ def calculate_gls_optimal_hedge(
 
 # --- Test Case ---
 
+
+
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
@@ -1065,12 +1067,11 @@ print(optimal_hedge.round(4))
 
 # 3:00
 
-import pandas as pd
-import numpy as np
+
 from sklearn.linear_model import LinearRegression
 
-def calculate_dispersion_matrix(iv_change_series, benchmarks):
-    
+def calculate_and_plot_gls_dispersion(iv_change_series, benchmarks):
+
     stock_tickers = [t for t in iv_change_series.columns if t not in benchmarks]
     df_clean = iv_change_series.dropna()
     
@@ -1083,25 +1084,49 @@ def calculate_dispersion_matrix(iv_change_series, benchmarks):
         A_T_list.append(model.coef_)
 
     A_T = np.array(A_T_list)
-    dispersion_A = pd.DataFrame(A_T.T, index=stock_tickers, columns=benchmarks)
+    A_matrix = pd.DataFrame(A_T.T, index=stock_tickers, columns=benchmarks)
     
-    return dispersion_A
-
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-def plot_dispersion_matrix(dispersion_matrix):
+    # Sort by the dispersion to the first benchmark for clearer visualization
+    A_matrix_sorted = A_matrix.sort_values(by=benchmarks[0], ascending=False)
     
-    plt.figure(figsize=(10, 12))
-    sns.heatmap(dispersion_matrix, cmap='coolwarm', annot=False)
-    plt.title('Dispersion Matrix A', fontsize=16)
-    plt.xlabel('Hedge Instruments (Benchmarks)')
+    plt.figure(figsize=(10, 14))
+    # Decision: annot=False because a 50x2 matrix is unreadable with numbers.
+    sns.heatmap(A_matrix_sorted, cmap='coolwarm', annot=False)
+    plt.title('GLS Dispersion Matrix "A" (Benchmark ~ All Stocks)', fontsize=16)
+    plt.xlabel('Hedge Instruments')
     plt.ylabel('Portfolio Stocks')
     plt.show()
+    
+    return A_matrix
 
-# --- Example Usage ---
-#
-# A_matrix = calculate_dispersion_matrix(iv_change_series, benchmarks)
-#
-# plot_dispersion_matrix(A_matrix)
+
+# Assume all necessary functions and the 'iv_change_series' DataFrame are defined.
+
+# 1. Define the benchmark assets
+benchmarks = ['SPY-UP', 'SPX']
+
+# 2. Calculate the required GLS dispersion matrix and visualize it
+A_matrix = calculate_and_plot_gls_dispersion(iv_change_series, benchmarks)
+
+# 3. Define portfolio structure and Vega assumptions
+stock_tickers = [t for t in iv_change_series.columns if t not in benchmarks]
+hedge_tickers = benchmarks
+
+portfolio_weights = pd.Series(1/len(stock_tickers), index=stock_tickers)
+vega_1_percent_stocks = pd.Series(100000.0, index=stock_tickers)
+vega_1_percent_hedges = pd.Series({'SPY-UP': 25000.0, 'SPX': 35000.0}, index=hedge_tickers)
+
+# 4. Calculate the optimal hedge using the GLS function and the calculated A_matrix
+optimal_hedge = calculate_gls_optimal_hedge(
+    portfolio_weights=portfolio_weights,
+    vega_1_percent_stocks=vega_1_percent_stocks,
+    vega_1_percent_hedges=vega_1_percent_hedges,
+    dispersion_matrix=A_matrix,
+    iv_change_series=iv_change_series
+)
+
+# 5. Display the final result
+print("\n--- Final GLS Optimal Hedge ---")
+print(optimal_hedge.round(4))
+
 
