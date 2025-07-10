@@ -876,5 +876,69 @@ def analyze_correlation_stability(iv_change_series, ticker1, ticker2, window=60)
 # static_corr_matrix, rolling_corr_series = analyze_correlation_stability(iv_change_series, 'AAPL-UQ', 'SPY-UP', window=90)
 
 
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def analyze_all_pairs_correlation(iv_change_series, benchmarks, window=60):
+    
+    non_benchmark_tickers = [t for t in iv_change_series.columns if t not in benchmarks]
+    df = iv_change_series[non_benchmark_tickers]
+    
+    results = []
+    
+    for i in range(len(df.columns)):
+        for j in range(i + 1, len(df.columns)):
+            ticker1 = df.columns[i]
+            ticker2 = df.columns[j]
+            
+            rolling_corr = df[ticker1].rolling(window=window).corr(df[ticker2]).dropna()
+            
+            if not rolling_corr.empty:
+                results.append({
+                    'pair': f"{ticker1}-{ticker2}",
+                    'mean_corr': rolling_corr.mean(),
+                    'std_dev_corr': rolling_corr.std(),
+                    'min_corr': rolling_corr.min(),
+                    'max_corr': rolling_corr.max()
+                })
+
+    corr_stability_df = pd.DataFrame(results).sort_values(by='mean_corr', ascending=False)
+    
+    plt.style.use('seaborn-v0_8-whitegrid')
+    plt.figure(figsize=(12, 8))
+    
+    sns.scatterplot(
+        data=corr_stability_df,
+        x='mean_corr',
+        y='std_dev_corr',
+        hue='mean_corr',
+        size='std_dev_corr',
+        sizes=(20, 200),
+        palette='viridis',
+        legend=False
+    )
+    
+    plt.title('Pairwise Correlation Stability Map', fontsize=16)
+    plt.xlabel('Mean Rolling Correlation', fontsize=12)
+    plt.ylabel('Standard Deviation of Rolling Correlation (Volatility)', fontsize=12)
+
+    # Annotate the most stable, highly correlated pair
+    most_stable_pair = corr_stability_df.sort_values(by=['mean_corr', 'std_dev_corr'], ascending=[False, True]).iloc[0]
+    plt.text(most_stable_pair['mean_corr'], most_stable_pair['std_dev_corr'], f"  Most Stable:\n  {most_stable_pair['pair']}", ha='left')
+
+    plt.tight_layout()
+    plt.show()
+
+    return corr_stability_df
+
+# Example Usage:
+# benchmarks = ['SPY-UP', 'SPX']
+# all_pairs_report = analyze_all_pairs_correlation(iv_change_series, benchmarks, window=90)
+# print("--- Top 10 Most Stable & Correlated Pairs ---")
+# print(all_pairs_report.head(10))
+# print("\n--- Top 10 Most Unstable (Volatile) Correlations ---")
+# print(all_pairs_report.sort_values(by='std_dev_corr', ascending=False).head(10))
 
 
