@@ -1036,43 +1036,56 @@ def calculate_gls_optimal_hedge(
 
 # --- Test Case ---
 
-# 1. Setup parameters
-n_stocks = 50
-stock_tickers = [f'STOCK_{i+1}' for i in range(n_stocks)]
-hedge_tickers = ['SPY-UP', 'SPX']
-m_hedges = len(hedge_tickers)
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
 
-# 2. Create sample portfolio and Vega data
-w = pd.Series(1/n_stocks, index=stock_tickers)
-z_stocks = pd.Series(100000.0, index=stock_tickers)
-z_hedges = pd.Series({'SPY-UP': 25000.0, 'SPX': 35000.0})
+# --- Setup from existing data ---
+# Assume 'iv_change_series' is your DataFrame of IV changes.
+# Assume 'benchmarks' is your list of hedge instrument tickers.
 
-# 3. Create sample Dispersion Matrix (A) and IV Change Series to get Sigma
-np.random.seed(42)
-A_dispersion_matrix = pd.DataFrame(
-    np.random.normal(1.0, 0.2, (n_stocks, m_hedges)),
-    index=stock_tickers,
-    columns=hedge_tickers
+stock_tickers = [t for t in iv_change_series.columns if t not in benchmarks]
+hedge_tickers = benchmarks
+
+# --- Define Portfolio and Vega Assumptions ---
+portfolio_weights = pd.Series(1/len(stock_tickers), index=stock_tickers)
+vega_1_percent_stocks = pd.Series(100000.0, index=stock_tickers)
+
+# Decision: Assume a Vega 1% for the hedging instruments.
+vega_1_percent_hedges = pd.Series({
+    'SPY-UP': 25000.0, 
+    'SPX': 35000.0
+}, index=hedge_tickers)
+
+
+# --- Calculate Dispersion Matrix 'A' from Time Series ---
+# Based on the model Δτ = AᵀΔσ, we regress each benchmark's IV change 
+# against all of the stock IV changes to find the coefficients that form Aᵀ.
+
+df_clean = iv_change_series.dropna()
+X_train = df_clean[stock_tickers]
+A_T_list = []
+
+for ticker in hedge_tickers:
+    y_train = df_clean[ticker]
+    model = LinearRegression(fit_intercept=False).fit(X_train, y_train)
+    A_T_list.append(model.coef_)
+
+A_T = np.array(A_T_list)
+A = pd.DataFrame(A_T.T, index=stock_tickers, columns=hedge_tickers)
+
+
+# --- Calculate the Optimal Hedge ---
+optimal_hedge = calculate_gls_optimal_hedge(
+    portfolio_weights=portfolio_weights,
+    vega_1_percent_stocks=vega_1_percent_stocks,
+    vega_1_percent_hedges=vega_1_percent_hedges,
+    dispersion_matrix=A,
+    iv_change_series=iv_change_series
 )
 
-# Generate correlated random IV changes to create a realistic Sigma
-temp_cov = np.random.uniform(0.3, 0.7, (n_stocks, n_stocks))
-temp_cov = np.dot(temp_cov, temp_cov.T) # Make it positive semi-definite
-np.fill_diagonal(temp_cov, 1)
-iv_changes = pd.DataFrame(
-    np.random.multivariate_normal(np.zeros(n_stocks), temp_cov, size=252),
-    columns=stock_tickers
-)
 
-# 4. Calculate the optimal hedge using the revised function
-optimal_gls_hedge = calculate_gls_optimal_hedge(
-    portfolio_weights=w,
-    vega_1_percent_stocks=z_stocks,
-    vega_1_percent_hedges=z_hedges,
-    dispersion_matrix=A_dispersion_matrix,
-    iv_change_series=iv_changes
-)
-
-# 5. Print results
+# --- Print Final Result ---
 print("--- GLS Optimal Hedge Weights ---\n")
-print(optimal_gls_hedge.round(4))
+print(optimal_hedge.round(4))
+
