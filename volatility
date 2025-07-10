@@ -1129,4 +1129,119 @@ optimal_hedge = calculate_gls_optimal_hedge(
 print("\n--- Final GLS Optimal Hedge ---")
 print(optimal_hedge.round(4))
 
+# 16:45 （Time Decay)
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def get_atm_vol_vs_expiry(surface_df, max_expiry_years=2.0):
+    """
+    Extracts the ATM volatility term structure from a single volatility surface.
+
+    Args:
+        surface_df (pd.DataFrame): The volatility surface for a single day.
+        max_expiry_years (float): The maximum time to expiry to consider.
+
+    Returns:
+        tuple: A tuple containing arrays for expiries (in years) and
+               corresponding ATM implied volatilities.
+    """
+    # Filter for expiries within the desired range
+    surface_df = surface_df[surface_df['Expiry'] <= max_expiry_years].copy()
+    if surface_df.empty:
+        return np.array([]), np.array([])
+
+    expiries_in_years = surface_df['Expiry'].values
+    
+    # Extract moneyness levels from column names (e.g., 'm_0_8')
+    iv_cols = sorted([c for c in surface_df.columns if c.startswith('m_')],
+                     key=lambda c: float(c.replace('m_', '').replace('_', '.')))
+    
+    moneyness_levels = np.array([float(c.replace('m_', '').replace('_', '.')) for c in iv_cols])
+    iv_values = surface_df[iv_cols].values
+
+    # Interpolate to find the ATM (moneyness=1.0) volatility for each expiry
+    atm_vols = np.apply_along_axis(
+        lambda row: np.interp(1.0, moneyness_levels, row),
+        axis=1,
+        arr=iv_values
+    )
+    
+    # Remove any NaN or zero values to ensure a clean fit
+    valid_indices = ~np.isnan(atm_vols) & (atm_vols > 0) & (expiries_in_years > 0)
+    
+    return expiries_in_years[valid_indices], atm_vols[valid_indices]
+
+
+def fit_power_law(expiries, vols):
+    """
+    Fits a power law (vol = c * T^k) to the volatility term structure.
+
+    The fit is performed using a linear regression on the log-transformed data:
+    log(vol) = k * log(T) + log(c).
+
+    Args:
+        expiries (np.array): Array of expiries in years.
+        vols (np.array): Array of corresponding ATM volatilities.
+
+    Returns:
+        tuple: A tuple containing the power law coefficient (k), the R-squared
+               value of the fit, and the intercept. Returns (nan, nan, nan) if
+               a fit is not possible.
+    """
+    if len(expiries) < 2:
+        return np.nan, np.nan, np.nan
+
+    log_T = np.log(expiries)
+    log_v = np.log(vols)
+
+    # Add a constant for the intercept term in the regression
+    X = sm.add_constant(log_T)
+    model = sm.OLS(log_v, X).fit()
+    
+    intercept, coefficient = model.params
+    r_squared = model.rsquared
+
+    return coefficient, r_squared, intercept
+
+# --- Plotting Total Variance for a Sample Ticker ---
+TICKER = 'AAPL-UQ'
+DATE = '2023-01-03'
+
+# Load a single surface for demonstration
+# Note: The 'load_single_surface' function is from your project description.
+# surface, _ = load_single_surface(TICKER, DATE)
+# expiries, atm_vols = get_atm_vol_vs_expiry(surface)
+
+# This is a placeholder for the plot as we cannot run the code.
+# In a real run, `expiries` and `atm_vols` would be populated.
+# total_variance = atm_vols**2 * expiries
+
+# plt.figure(figsize=(10, 6))
+# plt.plot(expiries, total_variance, 'o-', color='royalblue')
+# plt.title(f'Total Variance (σ²T) vs. Expiry for {TICKER} on {DATE}', fontsize=14)
+# plt.xlabel('Time to Expiry (Years)', fontsize=12)
+# plt.ylabel('Total Variance (σ²T)', fontsize=12)
+# plt.grid(True, linestyle='--', alpha=0.6)
+# plt.show()
+
+
+# --- Plotting Power Law Fit for a Sample Ticker ---
+# (Continuing with the same data as above)
+# k, r2, _ = fit_power_law(expiries, atm_vols)
+
+# plt.figure(figsize=(10, 6))
+# plt.loglog(expiries, atm_vols, 'o', label='Actual Data Points', color='darkorange')
+# fit_line = np.exp(_.intercept) * expiries**k
+# plt.loglog(expiries, fit_line, '-', label=f'Power Law Fit (k={k:.3f}, R²={r2:.3f})', color='navy')
+# plt.title(f'Log-Log Plot of IV vs. Expiry for {TICKER} on {DATE}', fontsize=14)
+# plt.xlabel('Log(Time to Expiry)', fontsize=12)
+# plt.ylabel('Log(Implied Volatility)', fontsize=12)
+# plt.legend()
+# plt.grid(True, which="both", ls="--", alpha=0.5)
+# plt.show()
+
 
