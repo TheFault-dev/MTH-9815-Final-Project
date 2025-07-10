@@ -945,3 +945,47 @@ def analyze_all_pairs_correlation(iv_change_series, benchmarks, window=60):
 # static_matrix, stability_report = analyze_all_pairs_correlation(iv_change_series, benchmarks, window=90)
 # print("\n--- Top 10 Most Stable & Correlated Pairs ---")
 # print(stability_report.sort_values(by='mean_corr', ascending=False).head(10))
+
+
+# 2:25
+
+import numpy as np
+from numpy.linalg import inv, pinv
+
+def hedge_weights(z, w, A, Sigma, x, use_pinv=False):
+    """
+    Returns optimal hedge weights u* that minimise E[(ΔP)^2].
+    
+    Parameters
+    ----------
+    z      : (n,)    dollar vega 1% per single name
+    w      : (n,)    portfolio weights
+    A      : (n,m)   dispersion matrix
+    Sigma  : (n,n)   vol-move correlation / covariance
+    x      : (m,)    dollar vega 1% per index instrument
+    use_pinv : bool  set True to fall back on Moore-Penrose
+    
+    Returns
+    -------
+    u_star : (m,)    contracts (or vega notional / x) for each hedge
+    h_star : (m,)    dollar vega per 1% change in each index
+    """
+    q = z * w                            # element-wise
+    lhs = A.T @ Sigma @ A
+    rhs = A.T @ Sigma @ q
+    solver = pinv if use_pinv else inv
+    h_star = solver(lhs) @ rhs
+    u_star = h_star / x                  # element-wise
+    return u_star, h_star
+
+n = 10
+m = 3
+z      = np.full(n, 1e5)         # $100k each
+w      = np.full(n, 1/n)         # equal weights
+A      = np.random.uniform(0.3, 0.9, size=(n, m))   # toy dispersion
+Sigma  = np.eye(n)               # uncorrelated vols for demo
+x      = np.full(m, 1e6)         # say $1 M vega per index option
+
+u_star, h_star = hedge_weights(z, w, A, Sigma, x)
+print("Index-contract hedge weights  u*:", u_star)
+print("Dollar-vega exposures         h*:", h_star)
