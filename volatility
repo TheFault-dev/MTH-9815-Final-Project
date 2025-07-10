@@ -1244,4 +1244,74 @@ DATE = '2023-01-03'
 # plt.grid(True, which="both", ls="--", alpha=0.5)
 # plt.show()
 
+# 5:30
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def fit_power_law(expiries, vols):
+    """Fits a power law (vol = c * T^k) to the volatility term structure."""
+    if len(expiries) < 2:
+        return np.nan, np.nan
+        
+    log_T = np.log(expiries)
+    log_v = np.log(vols)
+    X = sm.add_constant(log_T)
+    model = sm.OLS(log_v, X).fit()
+    
+    return model.params[1], model.rsquared # coefficient k, r_squared
+
+def calculate_decay_coefficients(tickers, start_date, end_date, db_path='vol_surfaces.h5', max_expiry_years=2.0):
+    """
+    Calculates the power law decay coefficient (k) for the ATM volatility
+    term structure for multiple tickers over a date range.
+    """
+    all_results = []
+    
+    with pd.HDFStore(db_path, mode='r') as store:
+        all_file_keys = store.keys()
+        for ticker in tickers:
+            ticker_key_prefix = f"/{ticker.replace('-', '_').replace('.', '')}/"
+            keys_for_ticker = [k for k in all_file_keys if k.startswith(ticker_key_prefix)]
+            
+            for key in keys_for_ticker:
+                date = pd.to_datetime(key.split('/')[-1].replace('d', ''), format='%Y%m%d')
+                if not (pd.to_datetime(start_date) <= date <= pd.to_datetime(end_date)):
+                    continue
+
+                surface_df = store.get(key)
+                
+                # Process the surface for ATM vol vs. expiry
+                surface_df = surface_df[surface_df['Expiry'] <= max_expiry_years].copy()
+                
+                # Directly use the 'm_1_0' column for ATM vol, no interpolation needed
+                atm_vols = surface_df['m_1_0'].values
+                expiries = surface_df['Expiry'].values
+                
+                valid_indices = (atm_vols > 0) & (expiries > 0) & ~np.isnan(atm_vols)
+                
+                if np.sum(valid_indices) < 2:
+                    continue
+                    
+                expiries_clean = expiries[valid_indices]
+                atm_vols_clean = atm_vols[valid_indices]
+                
+                # Fit the power law to get the decay coefficient
+                k, r2 = fit_power_law(expiries_clean, atm_vols_clean)
+                
+                if not np.isnan(k):
+                    all_results.append({'date': date, 'ticker': ticker, 'k': k, 'r_squared': r2})
+
+    return pd.DataFrame(all_results).sort_values(by=['ticker', 'date']).set_index('date')
+
+# Tickers for analysis
+TICKERS = ['AAPL-UQ', 'NVDA-UQ', 'TSLA-UQ', 'SPY-UP', 'JPM-UN']
+START_DATE = '2023-01-01'
+END_DATE = '2023-12-31'
+
+# Generate the results
+# decay_df = calculate_decay_coefficients(TICKERS, START_DATE, END_DATE)
 
