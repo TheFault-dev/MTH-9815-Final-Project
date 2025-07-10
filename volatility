@@ -671,32 +671,6 @@ def plot_iv_series(iv_change_series, benchmarks):
 import pandas as pd
 import numpy as np
 
-def calculate_dispersion_matrix(iv_change_series, benchmarks):
-    # Decision: We will use SPY-UP as the primary benchmark for this example analysis.
-    primary_benchmark = 'SPY-UP'
-    
-    betas = {}
-    cleaned_series = iv_change_series.dropna()
-    
-    y = cleaned_series[primary_benchmark]
-    
-    for ticker in cleaned_series.columns:
-        if ticker == primary_benchmark:
-            continue
-        x = cleaned_series[ticker]
-        beta = np.polyfit(y, x, 1)[0]
-        betas[ticker] = beta
-
-    beta_df = pd.DataFrame.from_dict(betas, orient='index', columns=['Beta_vs_' + primary_benchmark])
-    beta_df = beta_df.sort_values(by='Beta_vs_' + primary_benchmark, ascending=False)
-    
-    plt.figure(figsize=(10, 12))
-    sns.heatmap(beta_df, annot=True, cmap='coolwarm', fmt='.2f')
-    plt.title(f'Dispersion Beta vs. {primary_benchmark}', fontsize=16)
-    plt.show()
-    
-    return beta_df
-
 # Example Usage:
 # dispersion_betas = calculate_dispersion_matrix(iv_change_series, benchmarks)
 
@@ -1088,4 +1062,46 @@ optimal_hedge = calculate_gls_optimal_hedge(
 # --- Print Final Result ---
 print("--- GLS Optimal Hedge Weights ---\n")
 print(optimal_hedge.round(4))
+
+# 3:00
+
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+def calculate_dispersion_matrix(iv_change_series, benchmarks):
+    
+    stock_tickers = [t for t in iv_change_series.columns if t not in benchmarks]
+    df_clean = iv_change_series.dropna()
+    
+    X_train = df_clean[stock_tickers]
+    A_T_list = []
+
+    for ticker in benchmarks:
+        y_train = df_clean[ticker]
+        model = LinearRegression(fit_intercept=False).fit(X_train, y_train)
+        A_T_list.append(model.coef_)
+
+    A_T = np.array(A_T_list)
+    dispersion_A = pd.DataFrame(A_T.T, index=stock_tickers, columns=benchmarks)
+    
+    return dispersion_A
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plot_dispersion_matrix(dispersion_matrix):
+    
+    plt.figure(figsize=(10, 12))
+    sns.heatmap(dispersion_matrix, cmap='coolwarm', annot=False)
+    plt.title('Dispersion Matrix A', fontsize=16)
+    plt.xlabel('Hedge Instruments (Benchmarks)')
+    plt.ylabel('Portfolio Stocks')
+    plt.show()
+
+# --- Example Usage ---
+#
+# A_matrix = calculate_dispersion_matrix(iv_change_series, benchmarks)
+#
+# plot_dispersion_matrix(A_matrix)
 
