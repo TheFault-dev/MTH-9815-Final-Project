@@ -798,3 +798,83 @@ def vol_of_vol_predictive_model(iv_change_series, base_ticker, target_ticker):
 # target_ticker = 'AAPL-UQ' # Choose any stock from your list
 # vol_of_vol_predictive_model(iv_change_series, base_ticker, target_ticker)
 
+
+# 10:35
+
+
+import pandas as pd
+import numpy as np
+
+def winsorize_and_report_volatility(iv_change_series, method='sigma', threshold=3):
+    
+    original_vol = iv_change_series.std().sort_values(ascending=False)
+    print("--- Top 10 Most Volatile Series (Pre-Winsorization) ---")
+    print(original_vol.head(10))
+
+    winsorized_df = iv_change_series.copy()
+
+    for col in winsorized_df.columns:
+        series = winsorized_df[col].dropna()
+
+        if method == 'sigma':
+            mean = series.mean()
+            std_dev = series.std()
+            upper_bound = mean + threshold * std_dev
+            lower_bound = mean - threshold * std_dev
+        
+        elif method == 'mad':
+            median = series.median()
+            # Scaled MAD for comparison with standard deviation
+            mad = (series - median).abs().median() * 1.4826 
+            upper_bound = median + threshold * mad
+            lower_bound = median - threshold * mad
+        
+        else:
+            return None
+
+        winsorized_df[col] = winsorized_df[col].clip(lower=lower_bound, upper=upper_bound)
+
+    return winsorized_df
+
+# Example Usage:
+# winsorized_iv_changes = winsorize_and_report_volatility(iv_change_series, method='mad', threshold=3.5)
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def analyze_correlation_stability(iv_change_series, ticker1, ticker2, window=60):
+    
+    static_corr = iv_change_series.corr()
+    
+    print(f"--- Static Correlation for {ticker1} and {ticker2}: {static_corr.loc[ticker1, ticker2]:.4f} ---")
+    
+    rolling_corr = iv_change_series[ticker1].rolling(window=window).corr(iv_change_series[ticker2])
+    
+    fig, axes = plt.subplots(2, 1, figsize=(15, 10), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+    
+    axes[0].plot(iv_change_series.index, iv_change_series[ticker1], label=ticker1, lw=1.0)
+    axes[0].plot(iv_change_series.index, iv_change_series[ticker2], label=ticker2, lw=1.0)
+    axes[0].set_title(f'IV Change Series: {ticker1} vs. {ticker2}', fontsize=14)
+    axes[0].set_ylabel('IV Change')
+    axes[0].legend()
+    
+    axes[1].plot(rolling_corr.index, rolling_corr, label=f'{window}-Day Rolling Correlation', color='red')
+    axes[1].axhline(static_corr.loc[ticker1, ticker2], color='black', linestyle='--', lw=1.5, label='Static Correlation')
+    axes[1].set_title('Correlation Stability Analysis', fontsize=14)
+    axes[1].set_ylabel('Correlation')
+    axes[1].set_xlabel('Date')
+    axes[1].legend()
+    
+    plt.tight_layout()
+    plt.show()
+
+    return static_corr, rolling_corr
+
+# Example Usage:
+# Choose two tickers to compare, for example a tech giant and a benchmark.
+# static_corr_matrix, rolling_corr_series = analyze_correlation_stability(iv_change_series, 'AAPL-UQ', 'SPY-UP', window=90)
+
+
+
+
