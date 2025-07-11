@@ -1460,3 +1460,48 @@ def test_total_variance_slopes(slopes_df):
         })
         
     return pd.DataFrame(test_results)
+
+# 3:50
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_total_variance_drift(tickers_to_plot, iv_change_series_dict, maturities):
+    """
+    Plots the mean term structure of total variance changes ((Δσ)²T) and
+    a shaded envelope representing its historical drift for selected tickers.
+    """
+    plt.figure(figsize=(14, 8))
+    
+    dates = iv_change_series_dict[list(iv_change_series_dict.keys())[0]].index
+    maturity_keys = list(iv_change_series_dict.keys())
+    
+    for ticker in tickers_to_plot:
+        # Store the (Δσ)²T value for each day and each maturity
+        daily_total_variance = []
+        
+        for date in dates:
+            iv_changes = np.array([iv_change_series_dict[key].loc[date, ticker] for key in maturity_keys])
+            total_variance_change = iv_changes**2 * np.array(maturities)
+            daily_total_variance.append(total_variance_change)
+        
+        # Create a DataFrame with dates as index and maturities as columns
+        variance_df = pd.DataFrame(daily_total_variance, index=dates, columns=maturities)
+        
+        # Calculate statistics across time for each maturity
+        mean_curve = variance_df.mean(axis=0)
+        percentile_16 = variance_df.quantile(0.16, axis=0)
+        percentile_84 = variance_df.quantile(0.84, axis=0)
+        
+        # Plot the mean curve and the shaded envelope
+        line, = plt.plot(maturities, mean_curve, 'o-', label=f'Mean Curve - {ticker}')
+        plt.fill_between(maturities, percentile_16, percentile_84, color=line.get_color(), alpha=0.2, label=f'Drift Envelope (16-84th percentile) - {ticker}')
+
+    plt.title('Total Variance of IV Changes ((Δσ)²T) vs. Maturity', fontsize=16)
+    plt.xlabel('Maturity (Years)', fontsize=12)
+    plt.ylabel('(Δσ)²T', fontsize=12)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+
