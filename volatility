@@ -1315,3 +1315,148 @@ END_DATE = '2023-12-31'
 # Generate the results
 # decay_df = calculate_decay_coefficients(TICKERS, START_DATE, END_DATE)
 
+# 1:50
+
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import Ridge
+from statsmodels.tsa.stattools import adfuller
+from scipy import stats
+import matplotlib.pyplot as plt
+
+def calculate_power_law_coefficients(iv_change_series_dict, maturities, tickers, regularization_lambda=5.0):
+    results = []
+    # Assumes all DataFrames in the dict share the same index
+    dates = iv_change_series_dict[list(iv_change_series_dict.keys())[0]].index
+    maturity_keys = list(iv_change_series_dict.keys())
+
+    for ticker in tickers:
+        for date in dates:
+            term_structure_iv_change = [iv_change_series_dict[key].loc[date, ticker] for key in maturity_keys]
+            
+            iv_changes = np.array(term_structure_iv_change)
+            valid_mask = (iv_changes != 0) & ~np.isnan(iv_changes)
+
+            if np.sum(valid_mask) < 2:
+                continue
+            
+            # Using the absolute value of IV change for the log transform is a necessary step
+            y = np.log(np.abs(iv_changes[valid_mask]))
+            X = np.log(np.array(maturities)[valid_mask]).reshape(-1, 1)
+
+            model = Ridge(alpha=regularization_lambda, fit_intercept=True)
+            model.fit(X, y)
+            
+            k = model.coef_[0]
+            results.append({'date': date, 'ticker': ticker, 'k': k})
+            
+    return pd.DataFrame(results).pivot(index='date', columns='ticker', values='k')
+
+def plot_coefficient_time_series(coefficients_df, benchmarks):
+    plt.figure(figsize=(15, 8))
+    for ticker in coefficients_df.columns:
+        if ticker in benchmarks:
+            plt.plot(coefficients_df.index, coefficients_df[ticker], label=ticker, linewidth=2.5, linestyle='-')
+        else:
+            plt.plot(coefficients_df.index, coefficients_df[ticker], label=ticker, linewidth=1.0, linestyle='--')
+
+    plt.title('Time Series of Power Law Coefficient (k)', fontsize=16)
+    plt.xlabel('Date', fontsize=12)
+    plt.ylabel('Coefficient k', fontsize=12)
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', alpha=0.6)
+    plt.show()
+
+def plot_power_law_fit_example(ticker_to_plot, iv_change_series_dict, maturities, coefficients_df):
+    maturity_keys = list(iv_change_series_dict.keys())
+    avg_iv_changes = []
+    for key in maturity_keys:
+        # Calculate the average of the absolute change for plotting purposes
+        avg_change = np.mean(np.abs(iv_change_series_dict[key][ticker_to_plot]))
+        avg_iv_changes.append(avg_change)
+
+    avg_k = coefficients_df[ticker_to_plot].mean()
+    # Recalculate the intercept based on the average values
+    log_T = np.log(maturities)
+    log_abs_delta_sigma = np.log(avg_iv_changes)
+    avg_intercept = np.mean(log_abs_delta_sigma - avg_k * log_T)
+    
+    plt.figure(figsize=(10, 6))
+    plt.loglog(maturities, avg_iv_changes, 'o', label=f'Avg |Δσ| for {ticker_to_plot}')
+    
+    fit_line = np.exp(avg_intercept) * (np.array(maturities) ** avg_k)
+    plt.loglog(maturities, fit_line, '-', label=f'Fitted Power Law (Avg k={avg_k:.3f})')
+    
+    plt.title(f'Power Law Fit for {ticker_to_plot}', fontsize=16)
+    plt.xlabel('Maturity (Years) - Log Scale', fontsize=12)
+    plt.ylabel('Average |Δσ| - Log Scale', fontsize=12)
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
+    plt.show()
+
+def analyze_coefficient_stability(coefficients_df):
+    stability_results = []
+    for ticker in coefficients_df.columns:
+        series = coefficients_df[ticker].dropna()
+        
+        mean_k = series.mean()
+        std_k = series.std()
+        
+        # Drift calculated as the slope of k vs. time (in years)
+        time_in_years = (series.index - series.index[0]).days / 365.25
+        drift = np.polyfit(time_in_years, series, 1)[0]
+        
+        adf_result = adfuller(series)
+        
+        stability_results.append({
+            'Ticker': ticker,
+            'Mean (k)': mean_k,
+            'Std Dev': std_k,
+            'Drift (per year)': drift,
+            'ADF p-value': adf_result[1]
+        })
+        
+    return pd.DataFrame(stability_results)
+
+def analyze_total_variance_stability(iv_change_series_dict, maturities, tickers):
+    all_slopes = {}
+    dates = iv_change_series_dict[list(iv_change_series_dict.keys())[0]].index
+    maturity_keys = list(iv_change_series_dict.keys())
+    
+    for ticker in tickers:
+        daily_slopes = []
+        for date in dates:
+            term_structure_iv_change = [iv_change_series_dict[key].loc[date, ticker] for key in maturity_keys]
+            
+            iv_changes = np.array(term_structure_iv_change)
+            total_variance_change = iv_changes**2 * np.array(maturities)
+            
+            valid_mask = ~np.isnan(total_variance_change)
+            if np.sum(valid_mask) < 2:
+                daily_slopes.append(np.nan)
+                continue
+
+            # Regress (Δσ)²T against T to find the slope
+            slope = np.polyfit(np.array(maturities)[valid_mask], total_variance_change[valid_mask], 1)[0]
+            daily_slopes.append(slope)
+            
+        all_slopes[ticker] = daily_slopes
+        
+    return pd.DataFrame(all_slopes, index=dates)
+
+def test_total_variance_slopes(slopes_df):
+    test_results = []
+    for ticker in slopes_df.columns:
+        series = slopes_df[ticker].dropna()
+        
+        mean_slope = series.mean()
+        ttest_result = stats.ttest_1samp(series, 0)
+        
+        test_results.append({
+            'Ticker': ticker,
+            'Mean Slope': mean_slope,
+            't-statistic': ttest_result.statistic,
+            'p-value': ttest_result.pvalue
+        })
+        
+    return pd.DataFrame(test_results)
