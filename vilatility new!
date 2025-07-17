@@ -1,0 +1,1714 @@
+Below is a refactored, notebook-ready master script (Jupytext percent format) that implements the structure you requested. You can paste this into a .py file and open it in Jupyter (via Jupytext) or copy/paste cell-by-cell into a notebook.
+
+I’ve:
+	•	Kept all pyMFL calls intact (wrapped but not re-engineered).
+	•	Consolidated utilities (environment init, calendars, helpers, winsorization, interpolation math).
+	•	Separated conceptual markdown + code for each section (1–6 as you specified).
+	•	Made visualizations optional (boolean flags).
+	•	Dropped SPY-UP by default to reduce collinearity with SPX (configurable).
+	•	Merged GOOGL-UQ into GOOG-UQ (configurable).
+	•	Trimmed nonessential comments to tighten cells; retained decision-critical notes.
+	•	Added rigorous mathematical definitions in markdown cells using LaTeX.
+	•	Added lightweight caching dictionaries to avoid repeated CMDB pulls.
+	•	Provided hooks for forthcoming delta-sensitivity (Section 6) without forcing extra data loads now.
+
+Please review the markdown prose; edit wording/math if you prefer different notation. After you confirm, we can begin running cells, debugging paths, and layering in your forthcoming regression experiments.
+
+⸻
+
+IMPORTANT PATHS TO SET BEFORE RUNNING:
+	•	MFL_OUTPUT_DIR – your MFL output path (where your build lives).
+	•	HDF_SURFACE_PATH – where to store/read local vol surface warehouse.
+	•	CSV_DIR – folder containing previously exported atm_iv_change_<mat>.csv files (if used).
+
+⸻
+
+Master Volatility Surface Analysis Notebook (Refactored)
+
+# %% [markdown]
+# # Volatility Surface Analysis — Master Notebook
+#
+# Ruida Huang  
+# *(Refactored structure: utilities → data → correlation → term‐structure (VoV decay) → hedging → delta sensitivity.)*
+#
+# ---
+#
+# ## Mathematical Preliminaries & Notation
+#
+# We work with a universe of underlyings indexed by \(i \in \mathcal{I}\) and trading dates \(t \in \mathcal{T}\).
+#
+# - Underlying spot on date \(t\): \(S_t^{(i)}\).
+# - Option maturity (in **years**) \(T > 0\).
+# - Strike \(K>0\); *moneyness* \(m = K/S_t^{(i)}\).
+# - Market / model‐implied Black–Scholes volatility: \(\sigma_t^{(i)}(m,T)\).
+#
+# We will frequently refer to the **ATM slice**: \(m=1\) (i.e., \(K=S_t^{(i)}\)).
+#
+# ### Discrete Grids
+# Market data arrive on irregular grids of expiries \(\{T_j\}_j\) and moneyness (or deltas / strikes) \(\{m_k\}_k\) that depend on both ticker and date. We build interpolants
+# \[
+# \tilde\sigma_t^{(i)}(m,T) = \text{Interp}\bigl( \{(m_k,T_j,\sigma_{t,jk}^{(i)})\}_{j,k} \bigr)
+# \]
+# using **1D linear interpolation separately in \(T\) and \(m\)** as needed (details in Section 2.5).
+#
+# ### Constant-Maturity Series
+# For a chosen target maturity \(T_c\) (e.g., 30 calendar days ≈ 30/365.25), define the **constant-maturity ATM IV**:
+# \[
+# \widehat\sigma_t^{(i)}(T_c) := \tilde\sigma_t^{(i)}(m=1, T_c).
+# \]
+#
+# ### Fixed-Strike Change of IV
+# We study *changes* in IV that preserve yesterday’s strike when evaluating today’s surface. Let
+# \[
+# m_{t\leftarrow t-1}^{(i)} := \frac{S_{t-1}^{(i)}}{S_t^{(i)}} = \frac{K_{t-1,ATM}}{S_t^{(i)}}.
+# \]
+# Then the **fixed-strike IV change** over one step is
+# \[
+# \Delta \sigma_t^{(i)}(T_c) 
+# = \tilde\sigma_t^{(i)}\!\left(m_{t\leftarrow t-1}^{(i)},T_c\right) - \tilde\sigma_{t-1}^{(i)}\!\left(m=1,T_c\right).
+# \]
+# A percentage form is:
+# \[
+# \Delta^{\%} \sigma_t^{(i)} = \frac{\tilde\sigma_t^{(i)}(m_{t\leftarrow t-1},T_c)}{\tilde\sigma_{t-1}^{(i)}(1,T_c)} - 1.
+# \]
+#
+# ### Winsorization
+# For robustness we *clip* (winsorize) non-benchmark series columnwise using either
+# \[
+# [\mu \pm k\sigma] \quad\text{or}\quad [\text{median} \pm k \cdot \text{MAD}],
+# \]
+# where MAD is median absolute deviation. Benchmarks (broad indices) are left untouched to preserve scaling anchors.
+#
+# ---
+# Below we implement the full workflow in modular sections.
+
+# %% [markdown]
+# ## 1. Python Utilities & pyMFL Session Setup
+#
+# This section centralizes *all* imports, global config, MFL environment bootstrap, trading calendar utilities, and lightweight caches.
+#
+# **Inputs**  
+# - `MFL_OUTPUT_DIR`: path pointing to your current MFL build Output directory.  
+# - Optionally set environment variables before import if you run in a new kernel.  
+#
+# **Outputs**  
+# - A live pyMFL session.  
+# - Global memory caches for vol surfaces and prices.  
+
+# %% 
+import os
+import datetime as dt
+import warnings
+from functools import lru_cache
+
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+# seaborn is optional; import lazily in viz functions to keep base cells light
+
+# Stats / ML
+from scipy import stats
+from statsmodels.tsa.stattools import adfuller
+from sklearn.linear_model import LinearRegression, Ridge
+
+# Market calendar
+import pandas_market_calendars as mcal
+
+# ----- pyMFL imports (do not modify call pattern materially) -----
+import pymfl
+from pymfl.translator import translate
+
+# Global ignore of some pandas HDF warnings
+warnings.filterwarnings('ignore', category=pd.io.pytables.PerformanceWarning)
+
+# %% [markdown]
+# ### 1.1 Configuration
+#
+# Adjust the paths below for your environment.  
+# - `MFL_OUTPUT_DIR`: where your local MFL distribution stores `Output/`.
+# - `HDF_SURFACE_PATH`: persistent warehouse of translated vol surfaces.
+# - `CSV_DIR`: folder with pre-exported Δσ by maturity CSVs (if using offline path).
+#
+# Control options:
+# - `KEEP_SPY_UP`: if False, drop `SPY-UP` when both SPX & SPY are present (reduces collinearity).
+# - `MERGE_GOOGL_INTO_GOOG`: merge GOOGL-UQ into GOOG-UQ.
+
+# %%
+# ---- USER EDIT THESE PATHS ----
+MFL_OUTPUT_DIR = r"C:\Users\rhuan10\AppData\Local\MFL\Prod_Current_16.1.3-beta.43\Output"
+HDF_SURFACE_PATH = "vol_surfaces.h5"
+CSV_DIR = "."
+
+# ---- BEHAVIOR FLAGS ----
+KEEP_SPY_UP = False
+MERGE_GOOGL_INTO_GOOG = True
+
+# ---- BENCHMARK TICKERS ----
+# We'll conditionally drop SPY-UP below; keep SPX as canonical equity index vol.
+BENCHMARKS_BASE = ['SPX', 'DJI', 'SPY-UP']  # will filter later
+
+# Trading calendar (NYSE)
+_NYSE_CAL = mcal.get_calendar('NYSE')
+
+# %% [markdown]
+# ### 1.2 MFL Environment Bootstrap
+#
+# We replicate your original boot logic with one small enhancement: a guard so we only initialize once per kernel.
+#
+# **Support number discovery**:  
+# We inspect `<Output>/../Configs/MflConfig.xml` and read `<SupportNum>`. Default = 8 if missing.
+#
+# **PATH extension**:  
+# We prepend the local MFL `pkgs/support{n}/x64` directory to the process PATH so DLLs load.
+
+# %%
+import xml.etree.cElementTree as ET
+_MFL_INITIALIZED = False
+
+def _define_support(directory: str) -> int:
+    file_name = os.path.join(directory, '..', 'Configs', 'MflConfig.xml')
+    if not os.path.exists(file_name):
+        return 8
+    root = ET.parse(file_name).getroot()
+    support_num = root.find('.//SupportNum')
+    if support_num is None:
+        return 8
+    return int(support_num.text)
+
+def init_mfl(directory: str) -> None:
+    """Idempotent pyMFL bootstrap."""
+    global _MFL_INITIALIZED
+    if _MFL_INITIALIZED:
+        return
+    import pymfl_setup  # local import to keep module import light
+    pymfl_setup.start_mfl(directory, False)
+    support_num = _define_support(directory)
+    local_app_data = os.environ['LOCALAPPDATA']
+    pkgs = os.path.join(local_app_data, 'MFL', 'pkgs', f'support{support_num}', 'x64')
+    os.environ['PATH'] = pkgs + os.pathsep + os.environ['PATH']
+    _MFL_INITIALIZED = True
+
+# Initialize now
+init_mfl(MFL_OUTPUT_DIR)
+
+# %% [markdown]
+# ### 1.3 Trading Days Utility
+#
+# Helper to generate a pandas `DatetimeIndex` of NYSE trading days in a date interval \([t_0,t_1]\).
+# Choose `trading_only=True` to skip weekends/holidays (default).
+
+# %%
+def trading_days(start_date: str, end_date: str, trading_only: bool = True) -> pd.DatetimeIndex:
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    if trading_only:
+        schedule = _NYSE_CAL.schedule(start_date=start, end_date=end)
+        return mcal.date_range(schedule, frequency='1D')
+    else:
+        return pd.date_range(start, end, freq='D')
+
+
+⸻
+
+
+# %% [markdown]
+# ## 2. Data Loading, Storage & Manipulation
+#
+# This section covers:
+#
+# 1. **Vol surface structure from CMDB** (pyMFL array → tidy DataFrame).  
+# 2. **Local HDF5 warehouse** of surfaces (read/write).  
+# 3. **Constant-maturity IV series** construction.  
+# 4. **Fixed-strike change of IV** time series (absolute & %).  
+# 5. **Winsorization** (stock-only clipping).  
+# 6. **Bulk load of precomputed Δσ CSVs** (offline path).  
+# 7. **Interpolation details and error sources**.
+#
+# ---
+# ### 2.1 Vol Surface Structure Returned by `pymfl.CMDB().LoadVolatilities`
+#
+# The raw pyMFL result encodes a *ragged* table. After `translate()` you provided the following pattern:
+#
+# - `surface[0]`: header row with spot (index 1).  
+# - `surface[1]`: column headers (first two: valuation_date & expiry).  
+# - `surface[2:]`: data rows (each row = a maturity slice; columns = moneyness grid plus metadata).  
+#
+# We normalise to a `DataFrame`:
+#
+# | index (Date) | Expiry (years) | \(m_1\) | \(m_2\) | ... |
+# |--------------|----------------|---------|---------|-----|
+#
+# where \(m_k\) columns are floats (moneyness \(K/S\)). Attributes:
+#
+# - `.attrs['spot'] = S_t\)`
+# - `.attrs['valuation_date'] = t`
+#
+# Expiry is converted to **year fraction** (already so in your raw data—confirm if business-day vs ACT/365).
+
+# %%
+def load_iv_from_cmdb(valuation_date: dt.date, ticker: str, symbology: str = 'Bloomberg Equity'):
+    """
+    Low-level loader: returns raw pyMFL surface handle (not yet translated).
+    """
+    vol_label = 'NA CLOSE'
+    vol_load_options = {'map': symbology, 'useDates': True, 'Mid': True}
+    return pymfl.CMDB().LoadVolatilities(vol_label, ticker, valuation_date, vol_load_options)
+
+
+def get_iv_surface(ticker: str, date, symbology: str = 'Bloomberg Equity') -> pd.DataFrame | None:
+    """
+    High-level: translate, tidy, attach attrs, index by Date.
+    
+    Returns DataFrame with columns ['Expiry', m1, m2, ...] where m# are floats (moneyness).
+    """
+    # pyMFL expects datetime.date, not Timestamp
+    if isinstance(date, pd.Timestamp):
+        date_py = date.date()
+    elif isinstance(date, dt.datetime):
+        date_py = date.date()
+    elif isinstance(date, dt.date):
+        date_py = date
+    else:
+        date_py = pd.to_datetime(date).date()
+
+    raw = load_iv_from_cmdb(date_py, ticker, symbology=symbology)
+    if raw is None:
+        return None
+
+    surf = translate(raw)
+    # safety: sometimes translate returns None on missing data
+    if surf is None or len(surf) < 3:
+        return None
+
+    df = pd.DataFrame(data=surf[2:], columns=surf[1])
+    df.columns.values[:2] = ['Date', 'Expiry']  # first two are (valuation_date, expiry in years)
+    df.attrs['spot'] = surf[0][1]
+    df.attrs['valuation_date'] = surf[1][0]
+    df.set_index('Date', inplace=True)
+
+    # Ensure expiry numeric
+    df['Expiry'] = pd.to_numeric(df['Expiry'], errors='coerce')
+    # Ensure numeric moneyness columns
+    for c in df.columns:
+        if c == 'Expiry':
+            continue
+        try:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        except Exception:
+            pass
+
+    return df
+
+# %% [markdown]
+# ### 2.2 Lightweight In-Memory Cache
+#
+# Because repeated CMDB calls are expensive, we wrap `get_iv_surface` in a memoizing layer backed by a dict.  
+# Use `clear_surface_cache()` if you suspect stale data.
+
+# %%
+_surface_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame | None] = {}
+
+def cached_iv_surface(ticker: str, date) -> pd.DataFrame | None:
+    key = (ticker, pd.to_datetime(date))
+    if key not in _surface_cache:
+        _surface_cache[key] = get_iv_surface(ticker, date)
+    return _surface_cache[key]
+
+def clear_surface_cache():
+    _surface_cache.clear()
+
+# %% [markdown]
+# ### 2.3 HDF5 Warehouse of Vol Surfaces
+#
+# We persist *per-ticker, per-date* surfaces under keys:
+# \[
+# \texttt{/TICKER\_NORMALIZED/dYYYYMMDD}
+# \]
+# where `TICKER_NORMALIZED = ticker.replace('-', '_').replace('.', '')`.
+#
+# Each node stores a **table format** DataFrame plus attrs:
+# - `'spot'` = \(S_t\)
+# - `'valuation_date'` = date stamp (string from source)
+#
+# **Note:** This is I/O heavy; backfills across 50 stocks × 2 years can take time.  
+# Use the in-memory cache to avoid reloading from CMDB in the same session.
+
+# %%
+def _normalize_ticker_for_store(ticker: str) -> str:
+    return ticker.replace('-', '_').replace('.', '')
+
+def _hdf_key(ticker: str, date: pd.Timestamp) -> str:
+    return f"/{_normalize_ticker_for_store(ticker)}/{date.strftime('d%Y%m%d')}"
+
+def store_vol_surfaces_to_hdf(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    output_path: str = HDF_SURFACE_PATH,
+    trading_only: bool = True,
+    verbose: bool = True,
+) -> None:
+    """
+    Backfill & store surfaces to local HDF5.
+    """
+    dates = pd.to_datetime(trading_days(start_date, end_date, trading_only=trading_only))
+    with pd.HDFStore(output_path, mode='w', complevel=9, complib='blosc') as store:
+        for ticker in tickers:
+            if verbose:
+                print(f"[store] {ticker}")
+            for date in dates:
+                surf_df = cached_iv_surface(ticker, date)
+                if surf_df is None:
+                    continue
+                # rename numeric moneyness columns to HDF-safe labels
+                rename_map = {
+                    c: f"m_{str(c).replace('.', '_')}" for c in surf_df.columns
+                    if c != 'Expiry'
+                }
+                surf_df_out = surf_df.rename(columns=rename_map)
+                key = _hdf_key(ticker, date)
+                store.put(key, surf_df_out, format='table')
+                store.get_storer(key).attrs.metadata = {
+                    'spot': surf_df.attrs['spot'],
+                    'valuation_date': surf_df.attrs['valuation_date']
+                }
+
+# %% [markdown]
+# ### 2.4 Reading Back From HDF Warehouse
+#
+# We reconstruct the original structure (expiries + float moneyness).  
+# Metadata (spot) is also returned because it is needed for fixed-strike Δσ and later delta sensitivity.
+#
+# Returned object: `dict[pd.Timestamp, {'surface': DataFrame, 'spot': float}]`.
+
+# %%
+def load_surfaces_from_hdf(ticker: str, hdf_path: str = HDF_SURFACE_PATH) -> dict[pd.Timestamp, dict]:
+    out = {}
+    t_norm = _normalize_ticker_for_store(ticker)
+    prefix = f"/{t_norm}/"
+    if not os.path.exists(hdf_path):
+        raise FileNotFoundError(f"HDF path not found: {hdf_path}")
+    with pd.HDFStore(hdf_path, mode='r') as store:
+        keys = [k for k in store.keys() if k.startswith(prefix)]
+        for key in keys:
+            date_str = key.split('/')[-1].replace('d', '')
+            date = pd.to_datetime(date_str, format='%Y%m%d')
+            df = store.get(key)
+            meta = store.get_storer(key).attrs.metadata
+            # reverse column rename
+            inv_map = {
+                c: float(c.replace('m_', '').replace('_', '.'))
+                for c in df.columns if c != 'Expiry'
+            }
+            df = df.rename(columns=inv_map)
+            out[date] = {'surface': df, 'spot': meta['spot']}
+    return out
+
+# %% [markdown]
+# ### 2.5 Constant-Maturity ATM IV Series
+#
+# Given a target maturity \(T_c\), interpolate each day’s surface to \(T_c\) and \(m=1\):
+# \[
+# \widehat\sigma_t^{(i)}(T_c)= \text{Interp}_T \text{Interp}_m\, \sigma_t^{(i)}(m,T).
+# \]
+# We use **linear interpolation** both in maturity and in moneyness.  
+# If \(T_c\) is outside data range, we return `NaN`.
+
+# %%
+def _interp_const_maturity_atm(surface_df: pd.DataFrame, T_c: float) -> float | np.nan:
+    """Return ATM IV at constant maturity T_c from single-date surface_df."""
+    if surface_df is None or surface_df.empty:
+        return np.nan
+    expiries = surface_df['Expiry'].values.astype(float)
+    if expiries.size == 0 or np.all(np.isnan(expiries)):
+        return np.nan
+    # For m=1 exactly (ATM), pick nearest col; else interp across m
+    # Guarantee we have float moneyness columns
+    m_cols = [c for c in surface_df.columns if c != 'Expiry']
+    m_vals = np.array(m_cols, dtype=float)
+    # Extract vol matrix shape [n_expiry, n_m]
+    vmat = surface_df[m_cols].values.astype(float)
+    # Interp in T row-wise across maturities: we need column ATM via m-interp first
+    # Step 1: vol along m at each expiry
+    vol_atm_each_expiry = np.array([
+        np.interp(1.0, m_vals, row, left=np.nan, right=np.nan) for row in vmat
+    ])
+    # Step 2: interp across expiries to T_c
+    if np.all(np.isnan(vol_atm_each_expiry)):
+        return np.nan
+    # mask valid
+    mask = ~np.isnan(vol_atm_each_expiry) & ~np.isnan(expiries)
+    if mask.sum() < 2:
+        return np.nan
+    return float(np.interp(T_c, expiries[mask], vol_atm_each_expiry[mask], left=np.nan, right=np.nan))
+
+# %%
+def get_constant_maturity_iv(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    maturity: float = 30/365.25,
+    hdf_path: str = HDF_SURFACE_PATH,
+) -> pd.DataFrame:
+    """
+    Build DataFrame of constant-maturity ATM IV for each ticker between dates.
+    Reads from HDF warehouse (faster, reproducible).
+    """
+    dates = pd.to_datetime(trading_days(start_date, end_date, trading_only=True))
+    out = pd.DataFrame(index=dates, columns=tickers, dtype=float)
+    # load once per ticker
+    for ticker in tickers:
+        data = load_surfaces_from_hdf(ticker, hdf_path=hdf_path)
+        for date in dates:
+            if date not in data:
+                continue
+            surf_df = data[date]['surface']
+            out.loc[date, ticker] = _interp_const_maturity_atm(surf_df, maturity)
+    return out
+
+# %% [markdown]
+# ### 2.6 Fixed-Strike Change of IV Series (Absolute & %)
+#
+# Recall
+# \[
+# \Delta \sigma_t = \tilde\sigma_t(m_{t\leftarrow t-1},T_c) - \tilde\sigma_{t-1}(1,T_c),\qquad
+# m_{t\leftarrow t-1} = \frac{S_{t-1}}{S_{t}}.
+# \]
+# Percentage form divides by yesterday’s ATM IV.
+#
+# Implementation steps per ticker:
+#
+# 1. Load `dict[date] -> {surface, spot}` from HDF.
+# 2. Sort by date; shift to get previous day surface + spot.
+# 3. Evaluate constant maturity slice at all moneyness grid points.
+# 4. Interpolate in **m** to \(m_{t\leftarrow t-1}\).
+# 5. Return Δσ (or %).
+#
+# **Note:** We assume *calendar day adjacency* across available trading days; if a gap exists we treat the previous available date as \(t-1\).
+
+# %%
+def _constant_maturity_slice(surface_df: pd.DataFrame, T_c: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    For a single surface_df, return (m_grid, vols_at_Tc) after maturity interp.
+    """
+    expiries = surface_df['Expiry'].values.astype(float)
+    m_cols = [c for c in surface_df.columns if c != 'Expiry']
+    m_grid = np.array(m_cols, dtype=float)
+    vmat = surface_df[m_cols].values.astype(float)
+    # Interp across T for each m separately
+    vols_at_Tc = np.apply_along_axis(
+        lambda col: np.interp(T_c, expiries, col, left=np.nan, right=np.nan),
+        axis=0,
+        arr=vmat
+    )
+    return m_grid, vols_at_Tc  # length n_m
+
+
+def calculate_fixed_strike_iv_changes(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    db_path: str = HDF_SURFACE_PATH,
+    maturity_in_years: float = 30/365.25,
+    percentage: bool = False,
+) -> pd.DataFrame:
+    """
+    Vectorised re-write of your original function.
+    """
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    all_results = {}
+
+    with pd.HDFStore(db_path, mode='r') as store:
+        all_keys = store.keys()
+
+        for ticker in tickers:
+            t_norm = _normalize_ticker_for_store(ticker)
+            prefix = f"/{t_norm}/"
+            keys_tkr = [k for k in all_keys if k.startswith(prefix)]
+            if not keys_tkr:
+                continue
+
+            # Build sorted frame of surfaces
+            rows = []
+            for key in keys_tkr:
+                date = pd.to_datetime(key.split('/')[-1].replace('d', ''), format='%Y%m%d')
+                if not (start <= date <= end):
+                    continue
+                df = store.get(key)
+                meta = store.get_storer(key).attrs.metadata
+                spot = meta['spot']
+                # reverse rename
+                inv_map = {
+                    c: float(c.replace('m_', '').replace('_', '.'))
+                    for c in df.columns if c != 'Expiry'
+                }
+                df = df.rename(columns=inv_map)
+                rows.append((date, df, spot))
+
+            if not rows:
+                continue
+
+            rows.sort(key=lambda tup: tup[0])
+            dates = [r[0] for r in rows]
+            surf_list = [r[1] for r in rows]
+            spots = np.array([r[2] for r in rows], dtype=float)
+
+            prev_spots = np.roll(spots, 1)
+            prev_spots[0] = np.nan  # first row has no previous
+            prev_surfs = [None] + surf_list[:-1]
+
+            series_vals = []
+            for idx in range(len(rows)):
+                prev_spot = prev_spots[idx]
+                prev_surface = prev_surfs[idx]
+                if (prev_surface is None) or np.isnan(prev_spot):
+                    series_vals.append(np.nan)
+                    continue
+
+                # Yesterday ATM at T_c
+                m_grid_prev, prev_slice = _constant_maturity_slice(prev_surface, maturity_in_years)
+                prev_atm = np.interp(1.0, m_grid_prev, prev_slice, left=np.nan, right=np.nan)
+
+                # Today's vol at yesterday's strike m = prev_spot / today_spot
+                today_spot = spots[idx]
+                m_prev_strike = prev_spot / today_spot
+                m_grid_today, today_slice = _constant_maturity_slice(surf_list[idx], maturity_in_years)
+                today_vol_prev_strike = np.interp(m_prev_strike, m_grid_today, today_slice, left=np.nan, right=np.nan)
+
+                if percentage:
+                    val = today_vol_prev_strike / prev_atm - 1 if prev_atm and not np.isnan(prev_atm) else np.nan
+                else:
+                    val = today_vol_prev_strike - prev_atm
+                series_vals.append(val)
+
+            s = pd.Series(series_vals, index=pd.to_datetime(dates), name=ticker)
+            all_results[ticker] = s
+
+    final_df = pd.DataFrame(all_results)
+    return final_df
+
+# %% [markdown]
+# ### 2.6.1 Quick Sanity Check Helper
+#
+# Use this cell to spot if *identical* surfaces were written for different tickers on a given date (data QA).
+
+# %%
+def check_hdf_key_equality(ticker1: str, ticker2: str, date: str, db_path: str = HDF_SURFACE_PATH) -> None:
+    key1 = _hdf_key(ticker1, pd.to_datetime(date))
+    key2 = _hdf_key(ticker2, pd.to_datetime(date))
+    with pd.HDFStore(db_path, mode='r') as store:
+        if key1 not in store or key2 not in store:
+            print(f"[QA] Missing data for {ticker1} or {ticker2} on {date}.")
+            return
+        df1 = store.get(key1)
+        df2 = store.get(key2)
+        meta1 = store.get_storer(key1).attrs.metadata
+        meta2 = store.get_storer(key2).attrs.metadata
+        print(f"{ticker1} spot={meta1['spot']}  rows={len(df1)}  cols={len(df1.columns)}")
+        print(f"{ticker2} spot={meta2['spot']}  rows={len(df2)}  cols={len(df2.columns)}")
+        if df1.equals(df2):
+            print("**CRITICAL: surfaces identical**")
+        else:
+            print("Surfaces differ (good).")
+
+# %% [markdown]
+# ### 2.7 Winsorization (Columnwise, Non-Benchmarks Only)
+#
+# For each non-benchmark series \(x_t\) we compute clipping bounds:
+#
+# **Sigma method:**  
+# \( \text{lb} = \mu - k\sigma,\; \text{ub} = \mu + k\sigma. \)
+#
+# **MAD method:**  
+# \( \text{lb} = \text{median} - k \cdot \text{MAD},\;
+#    \text{ub} = \text{median} + k \cdot \text{MAD}, \)
+# where \(\text{MAD} = \text{median}(|x_t - \text{median}|)\). (Unscaled; you can multiply 1.4826 to approximate σ.)
+#
+# Benchmarks are not clipped because (i) they anchor scale & dispersion for hedging; (ii) we do not want to distort market-wide shocks.
+
+# %%
+def winsorize_df(
+    df: pd.DataFrame,
+    benchmarks: list[str],
+    method: str = 'mad',
+    threshold: float = 3.0,
+    report_top: int = 10,
+) -> pd.DataFrame:
+    out = df.copy()
+    if report_top:
+        pre_vol = out.std().sort_values(ascending=False)
+        print("--- Top Most Volatile (pre) ---")
+        print(pre_vol.head(report_top))
+
+    for col in out.columns:
+        if col in benchmarks:
+            continue
+        series = out[col].dropna()
+        if series.empty:
+            continue
+        if method == 'sigma':
+            mu = series.mean()
+            sd = series.std()
+            lb = mu - threshold * sd
+            ub = mu + threshold * sd
+        elif method == 'mad':
+            med = series.median()
+            mad = (series - med).abs().median()  # unscaled
+            lb = med - threshold * mad
+            ub = med + threshold * mad
+        else:
+            raise ValueError("method must be 'sigma' or 'mad'")
+        out[col] = out[col].clip(lower=lb, upper=ub)
+    return out
+
+# %% [markdown]
+# ### 2.8 Load Pre-Exported Δσ CSVs by Maturity (Offline Path)
+#
+# If you have already exported per-maturity CSVs (e.g., `atm_iv_change_1m.csv`), use this loader to rehydrate a dict:
+# \[
+# \{\text{label} \mapsto \Delta \sigma_{t}^{(\cdot)}(T_{\text{label}})\text{ DataFrame}\}.
+# \]
+
+# %%
+def load_iv_change_dict_from_csv(
+    maturity_keys: list[str],
+    file_prefix: str = 'atm_iv_change_',
+    directory: str = CSV_DIR,
+) -> dict[str, pd.DataFrame]:
+    out = {}
+    for key in maturity_keys:
+        path = os.path.join(directory, f"{file_prefix}{key}.csv")
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        out[key] = df
+    return out
+
+# %% [markdown]
+# ### 2.9 Interpolation Error Sources (Commentary)
+#
+# **Maturity Axis:** Market expiries are discrete listed dates. Linear interpolation in \(T\) assumes near-linear behaviour of IV between adjacent expiries. Short-dated curvature (earnings, events) violates this; error grows if \(T_c\) sits far from observed nodes.
+#
+# **Moneyness Axis:** Surfaces can be quoted in Δ rather than K/S; we treat provided numeric column headers as moneyness proxies. Linear interpolation in \(m\) ignores smile convexity; deep OTM wings may be poorly captured.
+#
+# **Fixed-Strike Change:** When computing \(m_{t\leftarrow t-1} = S_{t-1}/S_t\), large overnight gaps can push m outside the observed grid; extrapolation risk → NaN or boundary clamp.
+#
+# **Calendar Alignment:** Missing days (holidays, data gaps) break pure 1-day diffs; we implicitly compare to *previous available* surface.
+#
+# Track these in downstream error bars if used in production risk.
+
+
+⸻
+
+
+# %% [markdown]
+# ## 2.A Data Ingest Example (Run Cell After Config)
+#
+# This cell shows how to:
+# 1. Read SPY weights (universe selection).
+# 2. Build ticker set (top 50 + benchmarks).
+# 3. Apply *drop SPY-UP* and *merge GOOGL-UQ/GOOG-UQ* rules.
+# 4. Backfill to HDF (commented by default).
+# 5. Build Δσ time series for a few maturities.
+
+# %%
+# 1. Universe from weights file (edit path if needed)
+SPY_WEIGHTS_PATH = os.path.join(CSV_DIR, 'SPY_weights.csv')
+spy_weights = pd.read_csv(SPY_WEIGHTS_PATH)
+
+# 2. Top names
+top_50 = spy_weights.nlargest(50, 'ID().WEIGHTS')['CMDB Ticker'].tolist()
+
+# 3. Benchmarks (filter)
+benchmarks = BENCHMARKS_BASE.copy()
+if not KEEP_SPY_UP and 'SPY-UP' in benchmarks:
+    benchmarks.remove('SPY-UP')
+
+# Merge GOOGL into GOOG if requested
+if MERGE_GOOGL_INTO_GOOG:
+    # If both names appear in top_50, drop GOOGL-UQ
+    if 'GOOGL-UQ' in top_50:
+        top_50 = [t for t in top_50 if t != 'GOOGL-UQ']
+    # ensure GOOG-UQ present (if either existed)
+    if ('GOOG-UQ' not in top_50) and ('GOOGL-UQ' in spy_weights['CMDB Ticker'].tolist()):
+        top_50.append('GOOG-UQ')
+
+# Final ticker universe
+ALL_TICKERS = list(dict.fromkeys(top_50 + benchmarks))  # preserve order, dedupe
+print(f"{len(ALL_TICKERS)} tickers loaded (benchmarks filtered).")
+
+# %% [markdown]
+# #### 2.A.1 Optional Backfill to HDF
+# *Commented by default* — un-comment to build local store (can be slow).
+
+# %%
+# if False:
+#     store_vol_surfaces_to_hdf(
+#         tickers=ALL_TICKERS,
+#         start_date='2023-06-30',
+#         end_date='2025-06-30',
+#         output_path=HDF_SURFACE_PATH,
+#         trading_only=True,
+#         verbose=True,
+#     )
+
+# %% [markdown]
+# #### 2.A.2 Build Δσ Series for a Maturity (Example)
+#
+# Below: 30-day and 6-month examples (absolute & %); then winsorize.
+
+# %%
+IV_CHG_30D = calculate_fixed_strike_iv_changes(
+    tickers=ALL_TICKERS,
+    start_date='2023-06-30',
+    end_date='2025-06-30',
+    maturity_in_years=30/365.25,
+    db_path=HDF_SURFACE_PATH,
+    percentage=False,
+)
+
+IV_CHG_6M = calculate_fixed_strike_iv_changes(
+    tickers=ALL_TICKERS,
+    start_date='2023-06-30',
+    end_date='2025-06-30',
+    maturity_in_years=0.5,
+    db_path=HDF_SURFACE_PATH,
+    percentage=False,
+)
+
+IV_PCT_CHG_6M = calculate_fixed_strike_iv_changes(
+    tickers=ALL_TICKERS,
+    start_date='2023-06-30',
+    end_date='2025-06-30',
+    maturity_in_years=0.5,
+    db_path=HDF_SURFACE_PATH,
+    percentage=True,
+)
+
+# Winsorize (stock-only) using MAD*3
+IV_CHG_6M_W = winsorize_df(IV_CHG_6M, benchmarks=benchmarks, method='mad', threshold=3.0)
+IV_PCT_CHG_6M_W = winsorize_df(IV_PCT_CHG_6M, benchmarks=benchmarks, method='mad', threshold=3.0)
+
+
+⸻
+
+
+# %% [markdown]
+# ## 3. Correlation Structure & Dispersion Analysis of Δσ
+#
+# This section unifies correlation, stationarity, and simple hedge regressions.
+#
+# ### 3.1 Generic Pairwise Stats
+# Given a wide DataFrame \(X_t^{(i)} = \Delta \sigma_t^{(i)}\), we compute:
+# - Static correlation matrix \(\rho_{ij}\).
+# - Optional rolling correlation \( \rho_{ij}(t; w) = \text{Corr}(X_{t-w+1:t}^{(i)}, X_{t-w+1:t}^{(j)})\).
+# - Optional ADF stationarity test per column.
+#
+# Visualization flags control plotting.
+
+# %%
+def analyze_iv_correlation(
+    df: pd.DataFrame,
+    window: int = 60,
+    do_rolling: bool = False,
+    do_stationarity: bool = False,
+    plot_heatmap: bool = False,
+) -> dict:
+    out = {}
+    out['corr_static'] = df.corr()
+    if do_rolling:
+        # multi-index stack of rolling corr
+        roll = df.rolling(window=window).corr()
+        out['corr_rolling'] = roll
+    if do_stationarity:
+        stats_rows = []
+        for col in df.columns:
+            s = df[col].dropna()
+            if len(s) < 10:
+                continue
+            adf = adfuller(s)
+            stats_rows.append({
+                'Ticker': col,
+                'ADF_p': adf[1],
+                'Stat': adf[0],
+                'N': len(s),
+                'Stationary_5pct': adf[1] < 0.05,
+                'Stationary_1pct': adf[1] < 0.01,
+                'Mean': s.mean(),
+                'Std': s.std()
+            })
+        out['stationarity'] = pd.DataFrame(stats_rows).set_index('Ticker')
+
+    if plot_heatmap:
+        import seaborn as sns
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(out['corr_static'], cmap='viridis', annot=False)
+        plt.title('Static Correlation Matrix')
+        plt.show()
+
+    return out
+
+# %% [markdown]
+# ### 3.2 Select Benchmark & Drop Collinear Series
+#
+# We already dropped `SPY-UP` optionally, but you can also reduce the dataset to a smaller hedge universe before regression.
+#
+# Use `prepare_for_dispersion()` to:
+# - Drop any missing columns.  
+# - Align to intersection of available dates.  
+# - Optionally z-score each column (for regression stability).  
+
+# %%
+def prepare_for_dispersion(
+    df: pd.DataFrame,
+    benchmark: str,
+    zscore: bool = False,
+    dropna_how: str = 'any',
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Split df into (X_stocks, y_benchmark) where X excludes benchmark.
+    """
+    assert benchmark in df.columns, f"{benchmark} missing."
+    y = df[benchmark]
+    X = df.drop(columns=[benchmark])
+    if dropna_how == 'any':
+        mask = ~(X.isna().any(axis=1) | y.isna())
+        X = X.loc[mask]
+        y = y.loc[mask]
+    elif dropna_how == 'all':
+        mask = ~(X.isna().all(axis=1) | y.isna())
+        X = X.loc[mask].fillna(method='ffill')
+        y = y.loc[mask]
+    if zscore:
+        X = (X - X.mean()) / X.std()
+        y = (y - y.mean()) / y.std()
+    return X, y
+
+# %% [markdown]
+# ### 3.3 Dispersion Regression (Single Benchmark)
+#
+# Regress
+# \[
+# y_t = \sum_{i} a_i X_t^{(i)} + \epsilon_t
+# \]
+# across all dates in sample. With optional L1 or L2 penalty:
+# - L2: Ridge (closed form or `sklearn.Ridge`)
+# - L1: Lasso (not implemented yet; placeholder).
+#
+# Returned Series gives **dispersion loadings** \(a_i\).  
+# Sorting by magnitude provides a ranked hedge importance list.
+
+# %%
+def fit_dispersion(
+    df: pd.DataFrame,
+    benchmark: str,
+    penalty: str = 'none',
+    alpha: float = 1.0,
+    fit_intercept: bool = False,
+) -> pd.Series:
+    X, y = prepare_for_dispersion(df, benchmark, zscore=False, dropna_how='any')
+    if penalty == 'none':
+        mdl = LinearRegression(fit_intercept=fit_intercept).fit(X, y)
+    elif penalty == 'l2':
+        mdl = Ridge(alpha=alpha, fit_intercept=fit_intercept).fit(X, y)
+    else:
+        raise NotImplementedError("Only 'none' and 'l2' supported (L1 TBD).")
+    coeffs = pd.Series(mdl.coef_, index=X.columns, name=f'Beta_vs_{benchmark}')
+    coeffs = coeffs.sort_values(ascending=False)
+    return coeffs
+
+# %% [markdown]
+# ### 3.4 Multi-Benchmark Dispersion Matrix
+#
+# Stack Section 3.3 across a list of benchmarks to form matrix \(A\) where columns = benchmarks, rows = stocks.
+# This is the same object used later in GLS hedging.
+
+# %%
+def fit_dispersion_matrix(
+    df: pd.DataFrame,
+    benchmarks: list[str],
+    penalty: str = 'none',
+    alpha: float = 1.0,
+    fit_intercept: bool = False,
+    plot: bool = False,
+) -> pd.DataFrame:
+    mats = []
+    for b in benchmarks:
+        if b not in df.columns:
+            continue
+        coeffs = fit_dispersion(df, b, penalty=penalty, alpha=alpha, fit_intercept=fit_intercept)
+        mats.append(coeffs.rename(b))
+    A = pd.concat(mats, axis=1)
+    # ensure all stocks present across columns (outer join)
+    A = A.sort_index()
+    if plot:
+        import seaborn as sns
+        plt.figure(figsize=(10, max(6, 0.25*len(A))))
+        sns.heatmap(A.sort_values(by=benchmarks[0], ascending=False), cmap='coolwarm', annot=False)
+        plt.title('Dispersion Matrix')
+        plt.show()
+    return A
+
+# %% [markdown]
+# ### 3.5 Example: Correlation & Dispersion on 6M Δσ
+
+# %%
+CORR_RESULTS_6M = analyze_iv_correlation(
+    IV_CHG_6M_W,
+    window=90,
+    do_rolling=False,
+    do_stationarity=True,
+    plot_heatmap=False,
+)
+CORR_RESULTS_6M['stationarity'].head()
+
+# %%
+A_MATRIX_6M = fit_dispersion_matrix(
+    IV_CHG_6M_W,
+    benchmarks=benchmarks,   # chosen earlier
+    penalty='none',
+    plot=False,
+)
+A_MATRIX_6M.head()
+
+
+⸻
+
+
+# %% [markdown]
+# ## 4. Vol-of-Vol (Δσ) Term-Structure Decay
+#
+# We study how the *magnitude* of IV changes varies with maturity:
+# \[
+# |\Delta \sigma_t^{(i)}(T)| \approx c_t^{(i)} T^{k_t^{(i)}}.
+# \]
+# We fit \(k_t^{(i)}\) daily across a grid of maturities \(T_m\) drawn from your stored per-maturity Δσ DataFrames.
+#
+# Steps:
+# 1. Load dict of Δσ series by maturity label.
+# 2. For each ticker, each date, gather \(|\Delta\sigma|\) across maturities.
+# 3. Regress \(\log|\Delta\sigma|\) on \(\log T\) using Ridge(λ).
+# 4. Produce time series \(k_t^{(i)}\).
+#
+# Empirically you observed \(k \in [0.38, 0.52]\) converging toward short maturities.
+#
+# Visualization + stability tests optional.
+
+# %%
+def format_maturity_label(years: float) -> str:
+    months = int(round(years * 12))
+    if months % 12 == 0:
+        return f"{months // 12}y"
+    elif months == 18:
+        return "1.5y"
+    else:
+        return f"{months}m"
+
+# Default maturity grid (adjust as needed)
+MATURITIES_YRS = [1/12, 2/12, 3/12, 4/12, 6/12, 9/12, 1.0, 15/12, 18/12, 2.0]
+MATURITY_KEYS = [format_maturity_label(t) for t in MATURITIES_YRS]
+
+# %%
+IV_CHG_DICT = load_iv_change_dict_from_csv(MATURITY_KEYS, directory=CSV_DIR)  # offline path assumed
+
+# %% [markdown]
+# ### 4.1 Power-Law Fit Across Maturities (Daily)
+
+# %%
+def calculate_power_law_coefficients(
+    iv_change_series_dict: dict[str, pd.DataFrame],
+    maturities: list[float],
+    tickers: list[str],
+    regularization_lambda: float = 1e-5,
+) -> pd.DataFrame:
+    """
+    Returns DataFrame: index=date, columns=ticker, values=k_t.
+    """
+    # assume all share same date index; pick first
+    first_key = next(iter(iv_change_series_dict))
+    dates = iv_change_series_dict[first_key].index
+    maturity_keys = list(iv_change_series_dict.keys())
+
+    ks = []
+    idx_dates = []
+    idx_tickers = []
+
+    for date in dates:
+        for ticker in tickers:
+            try:
+                values = [iv_change_series_dict[k].loc[date, ticker] for k in maturity_keys]
+            except KeyError:
+                continue
+            arr = np.asarray(values, dtype=float)
+            mask = (arr != 0) & ~np.isnan(arr)
+            if mask.sum() < 2:
+                continue
+            y = np.log(np.abs(arr[mask]))
+            X = np.log(np.array(maturities)[mask]).reshape(-1, 1)
+            mdl = Ridge(alpha=regularization_lambda, fit_intercept=True)
+            mdl.fit(X, y)
+            k = mdl.coef_[0]
+            ks.append(k)
+            idx_dates.append(date)
+            idx_tickers.append(ticker)
+
+    dfk = pd.DataFrame({'date': idx_dates, 'ticker': idx_tickers, 'k': ks})
+    return dfk.pivot(index='date', columns='ticker', values='k').sort_index()
+
+# %%
+# Winsorize each maturity frame before fitting (stock-only)
+IV_CHG_DICT_W = {}
+for k, df in IV_CHG_DICT.items():
+    IV_CHG_DICT_W[k] = winsorize_df(df, benchmarks=benchmarks, method='mad', threshold=3.0, report_top=0)
+
+IV_CHG_PWR_K = calculate_power_law_coefficients(
+    iv_change_series_dict=IV_CHG_DICT_W,
+    maturities=MATURITIES_YRS,
+    tickers=ALL_TICKERS,
+    regularization_lambda=1e-3,
+)
+IV_CHG_PWR_K.head()
+
+# %% [markdown]
+# ### 4.2 Plot \(k_t\) Time Series (Optional)
+
+# %%
+def plot_power_k_series(k_df: pd.DataFrame, benchmarks: list[str], title: str = 'k(t)'):
+    plt.figure(figsize=(15, 8))
+    for col in k_df.columns:
+        if col in benchmarks:
+            plt.plot(k_df.index, k_df[col], label=col, linewidth=2.0, linestyle='-')
+        else:
+            plt.plot(k_df.index, k_df[col], label=col, linewidth=0.8, linestyle='--', alpha=0.7)
+    plt.axhline(0.5, color='black', lw=1.0, ls=':')
+    plt.title(title)
+    plt.ylabel('Power-law exponent k')
+    plt.xlabel('Date')
+    plt.legend(ncol=3, fontsize=8)
+    plt.grid(True, ls='--', alpha=0.4)
+    plt.show()
+
+# Example plot (comment if large)
+# plot_power_k_series(IV_CHG_PWR_K, benchmarks=benchmarks)
+
+# %% [markdown]
+# ### 4.3 Stability of \(k_t\)
+#
+# For each ticker:
+# - Mean, Std
+# - Drift slope vs. time (years)
+# - ADF test p‐value
+
+# %%
+def analyze_k_stability(k_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for ticker in k_df.columns:
+        s = k_df[ticker].dropna()
+        if len(s) < 10:
+            continue
+        t_years = (s.index - s.index[0]).days / 365.25
+        slope = np.polyfit(t_years, s.values, 1)[0]
+        adf = adfuller(s)
+        rows.append({
+            'Ticker': ticker,
+            'Mean_k': s.mean(),
+            'Std_k': s.std(),
+            'Drift_per_year': slope,
+            'ADF_p': adf[1],
+            'N': len(s)
+        })
+    return pd.DataFrame(rows).set_index('Ticker').sort_values(by='Mean_k', ascending=False)
+
+K_STAB = analyze_k_stability(IV_CHG_PWR_K)
+K_STAB.head()
+
+# %% [markdown]
+# ### 4.4 Total Variance Check: \((\Delta \sigma)^2 T\)
+#
+# For each date & ticker compute
+# \[
+# V_t^{(i)}(T_m) = \left(\Delta \sigma_t^{(i)}(T_m)\right)^2 \cdot T_m.
+# \]
+# If \(|\Delta\sigma|\sim T^{k}\) with \(k=1/2\), then \(V\) is flat in \(T\).
+# We regress \(V\) on \(T\) daily; slope near 0 indicates \(k \approx 0.5\).
+
+# %%
+def analyze_total_variance_slopes(
+    iv_change_series_dict: dict[str, pd.DataFrame],
+    maturities: list[float],
+    tickers: list[str],
+) -> pd.DataFrame:
+    first_key = next(iter(iv_change_series_dict))
+    dates = iv_change_series_dict[first_key].index
+    m_keys = list(iv_change_series_dict.keys())
+    slope_data = {}
+
+    for ticker in tickers:
+        slopes = []
+        for date in dates:
+            try:
+                vals = [iv_change_series_dict[k].loc[date, ticker] for k in m_keys]
+            except KeyError:
+                slopes.append(np.nan)
+                continue
+            arr = np.asarray(vals, dtype=float)
+            V = arr**2 * np.array(maturities)
+            mask = ~np.isnan(V)
+            if mask.sum() < 2:
+                slopes.append(np.nan)
+                continue
+            slope = np.polyfit(np.array(maturities)[mask], V[mask], 1)[0]
+            slopes.append(slope)
+        slope_data[ticker] = slopes
+    return pd.DataFrame(slope_data, index=dates)
+
+TV_SLOPES = analyze_total_variance_slopes(IV_CHG_DICT_W, MATURITIES_YRS, ALL_TICKERS)
+TV_SLOPES.head()
+
+# %% [markdown]
+# ### 4.5 Hypothesis Test \(H_0: \text{slope}=0\)
+#
+# One-sample t-test across dates.
+
+# %%
+def test_total_variance_slopes(slopes_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for ticker in slopes_df.columns:
+        s = slopes_df[ticker].dropna()
+        if len(s) < 5:
+            continue
+        ttest = stats.ttest_1samp(s, 0.0)
+        rows.append({
+            'Ticker': ticker,
+            'MeanSlope': s.mean(),
+            't_stat': ttest.statistic,
+            'p_value': ttest.pvalue,
+            'N': len(s),
+        })
+    return pd.DataFrame(rows).set_index('Ticker').sort_values(by='p_value')
+
+TV_SLOPE_TEST = test_total_variance_slopes(TV_SLOPES)
+TV_SLOPE_TEST.head()
+
+# %% [markdown]
+# ### 4.6 Visualize Total Variance Curves + Drift Envelope
+#
+# Mean & 16–84% envelope across time for selected tickers.
+
+# %%
+def plot_total_variance_drift(
+    tickers_to_plot: list[str],
+    iv_change_series_dict: dict[str, pd.DataFrame],
+    maturities: list[float],
+):
+    dates = iv_change_series_dict[next(iter(iv_change_series_dict))].index
+    m_keys = list(iv_change_series_dict.keys())
+    plt.figure(figsize=(14, 8))
+    for tkr in tickers_to_plot:
+        daily_V = []
+        for d in dates:
+            try:
+                vals = [iv_change_series_dict[k].loc[d, tkr] for k in m_keys]
+            except KeyError:
+                daily_V.append([np.nan]*len(maturities))
+                continue
+            arr = np.asarray(vals, dtype=float)
+            V = arr**2 * np.array(maturities)
+            daily_V.append(V)
+        V_df = pd.DataFrame(daily_V, index=dates, columns=maturities)
+        mean_curve = V_df.mean(axis=0)
+        p16 = V_df.quantile(0.16, axis=0)
+        p84 = V_df.quantile(0.84, axis=0)
+        line, = plt.plot(maturities, mean_curve, 'o-', label=tkr)
+        plt.fill_between(maturities, p16, p84, color=line.get_color(), alpha=0.2)
+    plt.axhline(0, color='k', lw=0.5)
+    plt.xlabel('Maturity (yrs)')
+    plt.ylabel('(Δσ)^2 T')
+    plt.title('Total Variance Drift Envelope')
+    plt.grid(True, ls='--', alpha=0.5)
+    plt.legend()
+    plt.show()
+
+# Example:
+# plot_total_variance_drift(['AAPL-UQ', 'MSFT-UQ', 'SPX'], IV_CHG_DICT_W, MATURITIES_YRS)
+
+# %% [markdown]
+# ### 4.7 Distribution of Daily Total Variance Magnitudes (Example: AAPL-UQ & SPX)
+#
+# We illustrate the wide dispersion of daily \((\Delta\sigma)^2 T\) (pick a maturity, e.g., 1M).
+
+# %%
+def plot_total_variance_hist(
+    ticker: str,
+    iv_change_series_dict: dict[str, pd.DataFrame],
+    maturities: list[float],
+    maturity_select: float = 1/12,  # 1M
+    bins: int = 50,
+):
+    # Find nearest maturity key
+    idx = np.argmin(np.abs(np.array(maturities) - maturity_select))
+    key = list(iv_change_series_dict.keys())[idx]
+    vals = iv_change_series_dict[key][ticker].dropna().values.astype(float)
+    V = vals**2 * maturities[idx]
+    plt.figure(figsize=(8,4))
+    plt.hist(V, bins=bins, alpha=0.7)
+    plt.xlabel('(Δσ)^2 T')
+    plt.ylabel('Count')
+    plt.title(f'Distribution of Daily Total Variance ({ticker}, ~{key})')
+    plt.grid(True, ls='--', alpha=0.4)
+    plt.show()
+
+# Example:
+# plot_total_variance_hist('AAPL-UQ', IV_CHG_DICT_W, MATURITIES_YRS, maturity_select=1/12)
+# plot_total_variance_hist('SPX', IV_CHG_DICT_W, MATURITIES_YRS, maturity_select=1/12)
+
+
+⸻
+
+
+# %% [markdown]
+# ## 5. Vega Hedging Framework
+#
+# We consider a **portfolio of stock options** (or effective Vega exposures) across names \(i\) with dollar-Vega \(q_i\) (per 1% vol shock).
+# We want to hedge with one or more **index options** (benchmarks) \(h \in \mathcal{H}\) whose dollar-Vega per contract is \(v_h\).
+#
+# From Section 3 we have a **dispersion matrix** \(A \in \mathbb{R}^{N \times H}\) giving regression betas mapping stock Δσ to hedge Δσ:
+# \[
+# \Delta \boldsymbol{\sigma}^H_t = A^\top \Delta \boldsymbol{\sigma}_t + \varepsilon_t.
+# \]
+#
+# Let \(Σ = \text{Cov}(\Delta \boldsymbol{\sigma}_t)\) across stocks.  
+# Hedger chooses hedge *dollar* Vega amounts \(h \in \mathbb{R}^H\) to minimize quadratic loss in benchmark vol shocks weighted by portfolio exposures:
+#
+# **Objective (GLS):**
+# \[
+# \min_{h} 
+# \mathbb{E}\Bigl[(\boldsymbol{q} - A h)^\top Σ (\boldsymbol{q} - A h)\Bigr].
+# \]
+# First-order condition yields
+# \[
+# h^\* = (A^\top Σ A)^{-1} A^\top Σ \boldsymbol{q}.
+# \]
+#
+# Contract units \(u_h = h_h / v_h\).
+#
+# Below: functions to compute \(A\), \(Σ\), and optimal hedge \(u^\*\).
+#
+# (Later, Section 6, we will extend to include **delta-linked vol sensitivity**.)
+
+# %%
+def calculate_gls_dispersion_matrix(
+    df: pd.DataFrame,
+    benchmarks: list[str],
+    penalty: str = 'none',
+    alpha: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Wrapper to get A for hedging; ensures all stocks align across benchmarks.
+    """
+    return fit_dispersion_matrix(df, benchmarks=benchmarks, penalty=penalty, alpha=alpha, fit_intercept=False, plot=False)
+
+# %%
+def calculate_gls_optimal_hedge(
+    portfolio_weights: pd.Series,
+    vega_1pct_stocks: pd.Series,
+    vega_1pct_hedges: pd.Series,
+    dispersion_matrix: pd.DataFrame,
+    iv_change_series: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    GLS hedge solution based on Section 5 formula.
+    
+    Parameters
+    ----------
+    portfolio_weights : shares or weights across stocks (aligned index)
+    vega_1pct_stocks  : $ per 1% vol move per *unit* position in each stock
+    vega_1pct_hedges  : $ per 1% vol move per *contract* in each hedge
+    dispersion_matrix : A-matrix (stocks x hedges) from fit_dispersion_matrix
+    iv_change_series  : Δσ DataFrame (stocks+hedges); used for Σ.
+    """
+    stock_tickers = portfolio_weights.index.tolist()
+    hedge_tickers = vega_1pct_hedges.index.tolist()
+
+    # q vector: dollar-Vega exposures of portfolio
+    q = (portfolio_weights * vega_1pct_stocks).reindex(stock_tickers).values.reshape(-1, 1)
+
+    # Covariance Σ over stocks only
+    Sigma = iv_change_series[stock_tickers].cov().values
+
+    # A matrix
+    A = dispersion_matrix.loc[stock_tickers, hedge_tickers].values
+
+    # GLS solution
+    ATS = A.T @ Sigma
+    ATS_A = ATS @ A
+    ATS_q = ATS @ q
+    ATS_A_inv = np.linalg.pinv(ATS_A)
+    h_star = ATS_A_inv @ ATS_q  # hedge $ Vega vector shape (H,1)
+    h_star = h_star.flatten()
+
+    # Convert to contract units
+    u_star = h_star / vega_1pct_hedges.reindex(hedge_tickers).values
+
+    res = pd.DataFrame({
+        'Hedge_Dollar_Vega': h_star,
+        'Hedge_Contracts': u_star,
+    }, index=hedge_tickers)
+    return res
+
+# %% [markdown]
+# ### 5.1 Example Hedge Calculation
+#
+# Simple equal-weight demo with placeholder Vega assumptions.
+
+# %%
+# Build A using 6M winsorized Δσ
+A_MATRIX_GLS = calculate_gls_dispersion_matrix(IV_CHG_6M_W, benchmarks=benchmarks)
+
+# Example portfolio: all non-benchmark names equal weight
+stock_names = [t for t in IV_CHG_6M_W.columns if t not in benchmarks]
+portfolio_weights = pd.Series(1.0/len(stock_names), index=stock_names)
+
+# Assume each stock 1% Vega = $100k
+vega_1pct_stocks = pd.Series(100000.0, index=stock_names)
+
+# Hedge instruments: choose first benchmark for now (extend to multi)
+# Here we use *all* in `benchmarks`; if you want single-index hedge, slice.
+vega_1pct_hedges = pd.Series(100000.0, index=benchmarks)
+
+GLS_HEDGE_RES = calculate_gls_optimal_hedge(
+    portfolio_weights=portfolio_weights,
+    vega_1pct_stocks=vega_1pct_stocks,
+    vega_1pct_hedges=vega_1pct_hedges,
+    dispersion_matrix=A_MATRIX_GLS,
+    iv_change_series=IV_CHG_6M_W,
+)
+GLS_HEDGE_RES
+
+
+⸻
+
+
+# %% [markdown]
+# ## 6. Delta-Linked Volatility Sensitivity (New)
+#
+# Motivation: Pure Vega hedging ignores that IV responds to *spot moves*.  
+# Empirically for many equities: as \(S\) rises, IV falls; indices show skew effects.  
+# When long index Vega vs. short single-name Vega, spot moves can create unhedged P&L.
+#
+# ### 6.1 Definition
+#
+# Let \(S_{t-1}, S_t\) be consecutive spots. Define daily return
+# \[
+# R_t = \frac{S_t}{S_{t-1}} - 1.
+# \]
+#
+# Evaluate **yesterday’s surface** at *today’s spot strike*:
+# \[
+# m_{t\text{(yday surface @ today spot)}} = \frac{S_t}{S_{t-1}}.
+# \]
+# Sticky‐strike vol (yday surface, today strike):
+# \[
+# \sigma_{t-1}^{\text{stick}} := \tilde\sigma_{t-1}\!\left(m = \frac{S_t}{S_{t-1}},\, T_c\right).
+# \]
+# Today ATM vol:
+# \[
+# \sigma_t^{\text{ATM}} := \tilde\sigma_t(1,T_c).
+# \]
+# **Delta sensitivity estimator**:
+# \[
+# \beta_t^{(S\to\sigma)} = \frac{\sigma_t^{\text{ATM}} - \sigma_{t-1}^{\text{stick}}}{R_t}.
+# \]
+# (Handle \(R_t \approx 0\) with ε threshold to avoid blow-ups.)
+#
+# We compute \( \beta_t \) for each ticker & date where both surfaces and spots exist.
+
+# %%
+def estimate_delta_vol_sensitivity_for_ticker(
+    ticker: str,
+    T_c: float,
+    db_path: str = HDF_SURFACE_PATH,
+    eps_return: float = 1e-6,
+) -> pd.Series:
+    """
+    Return Series beta_t for one ticker over available dates.
+    """
+    data = load_surfaces_from_hdf(ticker, hdf_path=db_path)
+    if not data:
+        return pd.Series(dtype=float)
+
+    # sort
+    dates = sorted(data.keys())
+    spots = np.array([data[d]['spot'] for d in dates], dtype=float)
+    surfs = [data[d]['surface'] for d in dates]
+
+    betas = []
+    for i in range(1, len(dates)):  # start from 1 (need prev day)
+        S_prev = spots[i-1]
+        S_curr = spots[i]
+        R = S_curr / S_prev - 1.0
+        if abs(R) < eps_return:
+            betas.append(np.nan)
+            continue
+
+        # Yesterday sticky vol at today's strike (m = S_curr/S_prev)
+        m_grid_prev, prev_slice = _constant_maturity_slice(surfs[i-1], T_c)
+        m_yday_today = S_curr / S_prev
+        sigma_stick = np.interp(m_yday_today, m_grid_prev, prev_slice, left=np.nan, right=np.nan)
+
+        # Today ATM vol
+        atm_today = _interp_const_maturity_atm(surfs[i], T_c)
+
+        beta = (atm_today - sigma_stick) / R if (atm_today is not None) else np.nan
+        betas.append(beta)
+
+    # align index (skip first date)
+    ser = pd.Series(betas, index=pd.to_datetime(dates[1:]), name=ticker)
+    return ser
+
+# %%
+def estimate_delta_vol_sensitivity(
+    tickers: list[str],
+    T_c: float,
+    db_path: str = HDF_SURFACE_PATH,
+) -> pd.DataFrame:
+    ser_list = []
+    for tkr in tickers:
+        s = estimate_delta_vol_sensitivity_for_ticker(tkr, T_c, db_path=db_path)
+        if not s.empty:
+            ser_list.append(s)
+    if not ser_list:
+        return pd.DataFrame()
+    return pd.concat(ser_list, axis=1)
+
+# %% [markdown]
+# ### 6.2 Example: Estimate β(S→σ) on 30-Day Horizon
+
+# %%
+DELTA_VOL_BETA_30D = estimate_delta_vol_sensitivity(
+    tickers=ALL_TICKERS,
+    T_c=30/365.25,
+    db_path=HDF_SURFACE_PATH,
+)
+DELTA_VOL_BETA_30D.head()
+
+# %% [markdown]
+# ### 6.3 Stability & Summary of Delta Sensitivity
+#
+# For each ticker we report mean, std, ADF stationarity p-value (optional).
+
+# %%
+def analyze_delta_vol_beta(df_beta: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for tkr in df_beta.columns:
+        s = df_beta[tkr].dropna()
+        if len(s) < 10:
+            continue
+        adf = adfuller(s)
+        rows.append({
+            'Ticker': tkr,
+            'Mean_beta': s.mean(),
+            'Std_beta': s.std(),
+            'ADF_p': adf[1],
+            'N': len(s),
+        })
+    return pd.DataFrame(rows).set_index('Ticker').sort_values(by='Mean_beta', ascending=False)
+
+DELTA_VOL_BETA_SUMMARY = analyze_delta_vol_beta(DELTA_VOL_BETA_30D)
+DELTA_VOL_BETA_SUMMARY.head()
+
+# %% [markdown]
+# ### 6.4 Optional Plot: Delta Sensitivity Time Series
+
+# %%
+def plot_delta_vol_beta(df_beta: pd.DataFrame, benchmarks: list[str]):
+    plt.figure(figsize=(15, 8))
+    for col in df_beta.columns:
+        if col in benchmarks:
+            plt.plot(df_beta.index, df_beta[col], label=col, lw=2.0, ls='-')
+        else:
+            plt.plot(df_beta.index, df_beta[col], label=col, lw=0.8, ls='--', alpha=0.6)
+    plt.axhline(0, color='k', lw=0.5)
+    plt.title('Delta→Vol Sensitivity β_t')
+    plt.ylabel('β = dσ / dR')
+    plt.xlabel('Date')
+    plt.legend(ncol=3, fontsize=8)
+    plt.grid(True, ls='--', alpha=0.4)
+    plt.show()
+
+# Example:
+# plot_delta_vol_beta(DELTA_VOL_BETA_30D[['AAPL-UQ','MSFT-UQ','SPX']], benchmarks=benchmarks)
+
+# %% [markdown]
+# ### 6.5 Toward a Joint Vega + Delta-Sensitivity Hedge (Sketch)
+#
+# **Idea:** Extend GLS objective to incorporate spot-induced vol effects.
+#
+# Suppose portfolio P&L to first order in vol shocks & spot-linked vol response is
+# \[
+# \text{dP} \approx \sum_i q_i \Delta \sigma_i + \sum_i q_i' \beta_i R_i
+# \]
+# where \(q_i\) are Vega exposures and \(q_i'\) scale how vol sensitivity impacts P&L (depends on model; placeholder = same as q_i or calibrate).
+#
+# Let \(R\) be vector of stock returns, \(B\) matrix mapping stock returns into hedge vol shocks via index skew, etc.  
+# A tractable quadratic program:
+# \[
+# \min_h \mathbb{E}\Bigl[(\boldsymbol{q} - A h)^\top Σ (\boldsymbol{q} - A h) 
+# + \lambda_\Delta (\boldsymbol{q}' - C h)^\top Ω (\boldsymbol{q}' - C h)
+# + \gamma \|h-h_{-1}\|_2^2 \Bigr]
+# \]
+# where:
+# - \(C\) maps hedge index returns into vol changes (proxy via β estimates on benchmarks).
+# - \(Ω = \text{Cov}(R)\) stock return cov matrix.
+# - \(h_{-1}\) prior hedge.
+# - \( \lambda_\Delta, \gamma\) weights.
+#
+# Below is a *computational skeleton*; we will need better economic mapping for \(q'\) and \(C\). For now we take \(q'=q\) and \(C=A\) as a rough starting point (interpretation: same structure drives both vol & delta linkage).
+
+# %%
+def joint_vega_delta_hedge(
+    q: pd.Series,              # dollar Vega exposures (stocks)
+    q_delta: pd.Series,        # effective delta-vol exposures (same index)
+    A: pd.DataFrame,           # dispersion stocks x hedges
+    Sigma_vol: pd.DataFrame,   # cov of Δσ stocks
+    Omega_ret: pd.DataFrame,   # cov of returns stocks
+    vega_hedges: pd.Series,    # $ Vega per hedge contract
+    lambda_delta: float = 1.0,
+    gamma_tc: float = 0.0,
+    h_prev: pd.Series | None = None,
+) -> pd.DataFrame:
+    """
+    Solve quadratic objective combining Vega + delta-linked vol risk.
+    Simplifying assumption: hedge mapping for delta leg = A (can generalize).
+    """
+    stocks = q.index.tolist()
+    hedges = vega_hedges.index.tolist()
+
+    # Align
+    qv = q.reindex(stocks).values.reshape(-1,1)
+    qd = q_delta.reindex(stocks).values.reshape(-1,1)
+    A_mat = A.loc[stocks, hedges].values
+    Sigma = Sigma_vol.loc[stocks, stocks].values
+    Omega = Omega_ret.loc[stocks, stocks].values
+
+    # Quadratic matrix & linear term
+    # Loss = (qv - A h)' Σ (qv - A h) + λ (qd - A h)' Ω (qd - A h) + γ ||h - h_prev||^2
+    # Expand: h' (A' Σ A + λ A' Ω A + γ I) h - 2 h' (A' Σ qv + λ A' Ω qd + γ h_prev)
+    M = A_mat.T @ Sigma @ A_mat + lambda_delta * (A_mat.T @ Omega @ A_mat)
+    b = A_mat.T @ Sigma @ qv + lambda_delta * (A_mat.T @ Omega @ qd)
+    if gamma_tc > 0.0:
+        M = M + gamma_tc * np.eye(len(hedges))
+        if h_prev is not None:
+            b = b + gamma_tc * h_prev.reindex(hedges).values.reshape(-1,1)
+
+    h_star = np.linalg.pinv(M) @ b
+    h_star = h_star.flatten()
+
+    # contract units
+    u_star = h_star / vega_hedges.reindex(hedges).values
+
+    res = pd.DataFrame({
+        'Hedge_Dollar_Vega': h_star,
+        'Hedge_Contracts': u_star,
+    }, index=hedges)
+    return res
+
+# %% [markdown]
+# ### 6.6 Example Joint Hedge (Placeholder Data)
+#
+# Here we re-use:
+# - \(q =\) `portfolio_weights * 100k`
+# - \(q_\Delta = q * Mean_beta` (rough proxy — replace with your economic mapping)
+# - \(Σ =\) cov of 6M Δσ
+# - $begin:math:text$Ω =$end:math:text$ cov of daily returns proxied from spots in HDF metadata (TODO: load)
+#
+# **TODO:** Implement returns loader from HDF metadata (spot series). Placeholder below uses random returns; replace once we extract real spots.
+
+# %%
+def load_spot_series_from_hdf(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    db_path: str = HDF_SURFACE_PATH,
+) -> pd.DataFrame:
+    """
+    Extract spot prices recorded in HDF metadata (per date).
+    """
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    spots_dict = {}
+    for tkr in tickers:
+        data = load_surfaces_from_hdf(tkr, hdf_path=db_path)
+        if not data:
+            continue
+        ser = pd.Series(
+            {d: v['spot'] for d, v in data.items() if start <= d <= end},
+            name=tkr,
+            dtype=float
+        )
+        spots_dict[tkr] = ser
+    if not spots_dict:
+        return pd.DataFrame()
+    spots_df = pd.concat(spots_dict, axis=1)
+    spots_df = spots_df.sort_index()
+    return spots_df
+
+# Example to build Omega
+SPOTS_DF = load_spot_series_from_hdf(ALL_TICKERS, '2023-06-30', '2025-06-30')
+RETURNS_DF = SPOTS_DF.pct_change().dropna(how='all')
+
+# %%
+# Build q & q_delta placeholders
+stock_names = [t for t in IV_CHG_6M_W.columns if t not in benchmarks]
+q_stock = pd.Series(100000.0, index=stock_names)  # $ per 1% vol bump
+# use mean beta as crude scale
+BETA_SUMMARY = analyze_delta_vol_beta(DELTA_VOL_BETA_30D)
+mean_beta = BETA_SUMMARY['Mean_beta'].reindex(stock_names).fillna(0.0)
+q_delta_stock = q_stock * mean_beta  # placeholder mapping
+
+# Cov matrices
+Sigma_vol = IV_CHG_6M_W[stock_names].cov()
+Omega_ret = RETURNS_DF[stock_names].cov()
+
+# vega of hedges
+vega_hedges = pd.Series(100000.0, index=benchmarks)
+
+JOINT_HEDGE_RES = joint_vega_delta_hedge(
+    q=q_stock,
+    q_delta=q_delta_stock,
+    A=A_MATRIX_GLS,
+    Sigma_vol=Sigma_vol,
+    Omega_ret=Omega_ret,
+    vega_hedges=vega_hedges,
+    lambda_delta=1.0,
+    gamma_tc=0.0,
+    h_prev=None,
+)
+JOINT_HEDGE_RES
+
+
+⸻
+
+
+# %% [markdown]
+# # Appendix
+#
+# - `clear_surface_cache()` to reset in-memory surfaces.  
+# - `check_hdf_key_equality()` for QA.  
+# - Quick interactive cells for ad-hoc inspection.
+#
+# Let me know when you’re ready to run through and we’ll debug any data path / translation issues together.
+
+
+⸻
+
+Next Steps / Your Review Checklist
+	1.	Paths: Update MFL_OUTPUT_DIR, HDF_SURFACE_PATH, CSV_DIR, and SPY_WEIGHTS_PATH to your environment.
+	2.	Universe: Confirm you want to drop SPY-UP (currently dropped) and merge GOOGL-UQ → GOOG-UQ.
+	3.	Backfill: Un-comment the backfill cell in Section 2.A.1 if you need to rebuild the HDF store.
+	4.	Delta Sensitivity: Once you confirm the definition, we can enhance q_delta mapping (currently placeholder).
+	5.	Transaction Costs: Provide cost per contract to activate (\gamma) term in joint hedge.
+
+I’ve tried to keep code lean without sacrificing clarity; math is localized in markdown before each functional block, so you can audit rigorously.
+
+Let me know what you want to run first or where to adjust notation, and we’ll proceed.
