@@ -1,0 +1,176 @@
+import pandas as pd
+import numpy as np
+
+def find_blocks(raw: pd.DataFrame, empty_thresh=0.95):
+    """
+    raw: sheet read with header=None, dtype=object
+    Returns list of (r0, r1, c0, c1) bounding boxes inclusive-exclusive.
+    """
+    # Treat empty strings as NaN
+    grid = raw.replace(r"^\s*$", np.nan, regex=True)
+
+    nonempty = grid.notna().to_numpy()
+    R, C = nonempty.shape
+
+    # Rows/cols that are mostly empty act as separators
+    row_nonempty_frac = nonempty.mean(axis=1)
+    col_nonempty_frac = nonempty.mean(axis=0)
+
+    row_is_sep = row_nonempty_frac < (1 - empty_thresh)
+    col_is_sep = col_nonempty_frac < (1 - empty_thresh)
+
+    # Identify candidate row segments between separators (but keep rows that have any content)
+    row_has_any = nonempty.any(axis=1)
+    col_has_any = nonempty.any(axis=0)
+
+    row_idxs = np.where(row_has_any)[0]
+    col_idxs = np.where(col_has_any)[0]
+    if len(row_idxs) == 0 or len(col_idxs) == 0:
+        return []
+
+    # A simpler robust method: connected components on nonempty mask
+    # Using BFS over cells might be heavy; instead we do bounding boxes by scanning for clusters.
+    visited = np.zeros_like(nonempty, dtype=bool)
+    blocks = []
+
+    for r in range(R):
+        for c in range(C):
+            if nonempty[r, c] and not visited[r, c]:
+                # BFS
+                stack = [(r, c)]
+                visited[r, c] = True
+                rs, cs = [r], [c]
+
+                while stack:
+                    rr, cc = stack.pop()
+                    for dr, dc in [(1,0), (-1,0), (0,1), (0,-1)]:
+                        r2, c2 = rr + dr, cc + dc
+                        if 0 <= r2 < R and 0 <= c2 < C and nonempty[r2, c2] and not visited[r2, c2]:
+                            visited[r2, c2] = True
+                            stack.append((r2, c2))
+                            rs.append(r2)
+                            cs.append(c2)
+
+                r0, r1 = min(rs), max(rs) + 1
+                c0, c1 = min(cs), max(cs) + 1
+
+                # Expand to include header row/col holes inside the box
+                block = grid.iloc[r0:r1, c0:c1]
+                # Keep only if it looks like a table (>=2 rows, >=2 cols)
+                if block.shape[0] >= 2 and block.shape[1] >= 2:
+                    blocks.append((r0, r1, c0, c1))
+
+    # Sort blocks top-to-bottom, left-to-right
+    blocks.sort(key=lambda x: (x[0], x[2]))
+    return blocks
+
+def block_to_df(raw: pd.DataFrame, bbox):
+    r0, r1, c0, c1 = bbox
+    block = raw.iloc[r0:r1, c0:c1].copy()
+
+    # Drop fully empty rows/cols inside the block
+    block = block.dropna(how="all").dropna(axis=1, how="all")
+
+    # Promote first row to header
+    header = block.iloc[0].astype(str).str.strip()
+    df = block.iloc[1:].copy()
+    df.columns = header
+
+    # Clean whitespace
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+
+    return df.reset_index(drop=True)
+
+# Usage
+path = "your_file.xlsx"
+sheet = "YourSheetName"
+
+raw = pd.read_excel(path, sheet_name=sheet, header=None, dtype=object)
+blocks = find_blocks(raw)
+
+tables = []
+for i, bbox in enumerate(blocks):
+    df = block_to_df(raw, bbox)
+    tables.append(df)
+    print(i, df.shape, list(df.columns)[:6])
+
+
+from datetime import datetime
+import pandas as pd
+import numpy as np
+
+def add_T_columns(df, asof_date, date_col_parser=pd.to_datetime, day_count=365.0):
+    """
+    Converts all columns that parse as dates into year-fraction T,
+    returning a long-form table with ['name','strike','T','value'] style if desired.
+    """
+    asof = pd.Timestamp(asof_date)
+
+    new_cols = {}
+    for c in df.columns:
+        try:
+            d = date_col_parser(c)
+            if pd.notna(d):
+                T = (d - asof).days / day_count
+                new_cols[c] = float(T)
+        except Exception:
+            pass
+
+    return new_cols  # mapping original col -> T
+
+# Example: rename maturity columns to numeric T
+asof_date = "2026-02-18"  # today in your timezone context
+col_to_T = add_T_columns(vol_df, asof_date=asof_date)
+
+vol_df_renamed = vol_df.rename(columns=col_to_T)
+
+
+
+def surface_to_long(df, id_vars, value_name):
+    long = df.melt(id_vars=id_vars, var_name="T", value_name=value_name)
+    long["T"] = pd.to_numeric(long["T"], errors="coerce")
+    return long.dropna(subset=["T"])
+
+def add_total_variance(long, iv_col, out_col="w"):
+    long[iv_col] = pd.to_numeric(long[iv_col], errors="coerce")
+    long[out_col] = (long[iv_col] ** 2) * long["T"]
+    return long
+
+# Example
+# Suppose id_vars = ["Name", "Strike"] or ["Name","K"] etc.
+svi7_long = surface_to_long(vol_svi7_df_renamed, id_vars=["Name", "Strike"], value_name="iv7")
+svi3_long = surface_to_long(vol_svi3_df_renamed, id_vars=["Name", "Strike"], value_name="iv3")
+
+svi7_long = add_total_variance(svi7_long, "iv7", "w7")
+svi3_long = add_total_variance(svi3_long, "iv3", "w3")
+
+merged = svi7_long.merge(svi3_long, on=["Name", "Strike", "T"], how="inner")
+merged["dw"] = merged["w7"] - merged["w3"]
+merged["div"] = merged["iv7"] - merged["iv3"]
+
+
+
+
+def rank_contributors(df, use_vega=False, use_weight=False):
+    tmp = df.copy()
+    tmp["abs_dw"] = tmp["dw"].abs()
+
+    score = tmp["abs_dw"]
+    if use_vega and "Vega" in tmp.columns:
+        score = score * pd.to_numeric(tmp["Vega"], errors="coerce").fillna(0.0)
+    if use_weight and "Weight" in tmp.columns:
+        score = score * pd.to_numeric(tmp["Weight"], errors="coerce").fillna(0.0)
+
+    tmp["score"] = score
+    out = (tmp.groupby("Name", as_index=False)["score"]
+             .sum()
+             .sort_values("score", ascending=False))
+    return out
+
+# If you have weights table:
+# weights_df columns: Name, Weight
+merged2 = merged.merge(weights_df[["Name","Weight"]], on="Name", how="left")
+
+top = rank_contributors(merged2, use_vega=False, use_weight=True)
+print(top.head(20))
+
