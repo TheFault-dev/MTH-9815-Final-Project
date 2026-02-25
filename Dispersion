@@ -1,0 +1,198 @@
+"""
+Module 1: Data Extraction and Parquet Serialization
+This module establishes a connection to the OptionMetrics database using your existing database module.
+It executes SQL queries to retrieve standardized thirty-day implied volatility, thirty-day realized volatility, and closing prices.
+Querying the volatility_surface table avoids the microstructural noise and interpolation complexities of raw option prices.
+The extracted data is immediately serialized to Parquet format to completely eliminate I/O bottlenecks in downstream research.
+"""
+import pandas
+import matplotlib.pyplot
+import db
+
+with db.open_db_connection("Ivy") as database_cursor:
+    database_cursor.execute(
+        """
+        SELECT 
+            secid AS security_identification, 
+            date AS observation_date, 
+            impl_volatility AS implied_volatility 
+        FROM dbo.volatility_surface 
+        WHERE days = 30 AND call_put = 'C' AND delta = 50 AND date >= '2020-01-01'
+        """
+    )
+    implied_volatility_column_names = [column_metadata[0] for column_metadata in database_cursor.description]
+    implied_volatility_dataframe = pandas.DataFrame(database_cursor.fetchall(), columns=implied_volatility_column_names)
+    
+    database_cursor.execute(
+        """
+        SELECT 
+            secid AS security_identification, 
+            date AS observation_date, 
+            volatility AS realized_volatility 
+        FROM dbo.historical_volatility 
+        WHERE days = 30 AND date >= '2020-01-01'
+        """
+    )
+    realized_volatility_column_names = [column_metadata[0] for column_metadata in database_cursor.description]
+    realized_volatility_dataframe = pandas.DataFrame(database_cursor.fetchall(), columns=realized_volatility_column_names)
+
+    database_cursor.execute(
+        """
+        SELECT 
+            secid AS security_identification, 
+            date AS observation_date, 
+            close AS closing_price 
+        FROM dbo.security_price 
+        WHERE date >= '2020-01-01'
+        """
+    )
+    security_price_column_names = [column_metadata[0] for column_metadata in database_cursor.description]
+    security_price_dataframe = pandas.DataFrame(database_cursor.fetchall(), columns=security_price_column_names)
+
+implied_volatility_dataframe.to_parquet("historical_implied_volatility_data.parquet", index=False)
+realized_volatility_dataframe.to_parquet("historical_realized_volatility_data.parquet", index=False)
+security_price_dataframe.to_parquet("historical_security_price_data.parquet", index=False)
+
+implied_volatility_dataframe['observation_date'] = pandas.to_datetime(implied_volatility_dataframe['observation_date'])
+observation_counts_per_date_series = implied_volatility_dataframe.groupby('observation_date').size()
+
+figure_object, axes_object = matplotlib.pyplot.subplots(figsize=(10, 5))
+axes_object.plot(observation_counts_per_date_series.index, observation_counts_per_date_series.values, color='navy')
+axes_object.set_title("Volume of Extracted Implied Volatility Observations Over Time")
+axes_object.set_xlabel("Observation Date")
+axes_object.set_ylabel("Count of Unique Securities")
+axes_object.grid(True, alpha=0.3)
+matplotlib.pyplot.show()
+
+
+"""
+Module 2: Volatility Risk Premium and Stylized Facts Exploration
+This module loads the serialized Parquet data, merges implied volatility and historical realized volatility, and computes the Volatility Risk Premium.
+We aggregate the premium cross-sectionally to verify the market-wide stylized fact that implied volatility generally trades at a premium to realized volatility.
+This serves as the foundational data exploration to identify the specific securities that exhibit structurally underpriced implied volatility over time.
+"""
+import pandas
+import matplotlib.pyplot
+
+implied_volatility_dataframe = pandas.read_parquet("historical_implied_volatility_data.parquet")
+realized_volatility_dataframe = pandas.read_parquet("historical_realized_volatility_data.parquet")
+
+merged_volatility_dataframe = pandas.merge(
+    implied_volatility_dataframe,
+    realized_volatility_dataframe,
+    on=["security_identification", "observation_date"],
+    how="inner"
+)
+
+merged_volatility_dataframe = merged_volatility_dataframe.dropna()
+merged_volatility_dataframe["volatility_risk_premium"] = (
+    merged_volatility_dataframe["implied_volatility"] - merged_volatility_dataframe["realized_volatility"]
+)
+
+merged_volatility_dataframe["observation_date"] = pandas.to_datetime(merged_volatility_dataframe["observation_date"])
+average_daily_premium_dataframe = merged_volatility_dataframe.groupby("observation_date")["volatility_risk_premium"].mean().reset_index()
+average_daily_premium_dataframe = average_daily_premium_dataframe.sort_values(by="observation_date")
+
+figure_object, axes_object = matplotlib.pyplot.subplots(figsize=(12, 6))
+axes_object.plot(
+    average_daily_premium_dataframe["observation_date"], 
+    average_daily_premium_dataframe["volatility_risk_premium"], 
+    color="darkred", 
+    linewidth=1.5
+)
+axes_object.axhline(y=0, color="black", linestyle="dashed")
+axes_object.set_title("Cross-Sectional Average Volatility Risk Premium Over Time")
+axes_object.set_xlabel("Observation Date")
+axes_object.set_ylabel("Implied Volatility Minus Realized Volatility")
+axes_object.grid(True, alpha=0.3)
+matplotlib.pyplot.show()
+
+
+"""
+Module 3: Correlation Structure and Random Matrix Theory Diagnostics
+This module pivots historical prices to compute a daily logarithmic return matrix across all securities.
+It calculates the empirical correlation matrix and performs eigenvalue decomposition.
+Using Random Matrix Theory, we calculate the Marchenko-Pastur theoretical upper bound for random noise eigenvalues.
+Plotting the empirical eigenvalue distribution against this bound allows us to isolate true economic structural factors from idiosyncratic noise, strictly ensuring downstream hedge stability.
+"""
+import pandas
+import numpy
+import matplotlib.pyplot
+
+historical_security_price_dataframe = pandas.read_parquet("historical_security_price_data.parquet")
+historical_security_price_dataframe["observation_date"] = pandas.to_datetime(historical_security_price_dataframe["observation_date"])
+
+price_pivot_dataframe = historical_security_price_dataframe.pivot(
+    index="observation_date", 
+    columns="security_identification", 
+    values="closing_price"
+)
+price_pivot_dataframe = price_pivot_dataframe.dropna(axis=1, thresh=int(len(price_pivot_dataframe) * 0.9))
+price_pivot_dataframe = price_pivot_dataframe.interpolate(method="linear", limit_direction="both")
+
+logarithmic_returns_dataframe = numpy.log(price_pivot_dataframe / price_pivot_dataframe.shift(1)).dropna()
+empirical_correlation_matrix = logarithmic_returns_dataframe.corr().to_numpy()
+
+eigenvalues_array, eigenvectors_matrix = numpy.linalg.eigh(empirical_correlation_matrix)
+eigenvalues_array = numpy.sort(eigenvalues_array)[::-1]
+
+number_of_time_observations, number_of_assets = logarithmic_returns_dataframe.shape
+matrix_dimension_ratio = number_of_assets / number_of_time_observations
+marchenko_pastur_upper_bound = (1 + numpy.sqrt(matrix_dimension_ratio)) ** 2
+
+figure_object, axes_object = matplotlib.pyplot.subplots(figsize=(10, 6))
+axes_object.hist(eigenvalues_array, bins=100, density=True, color="teal", alpha=0.7)
+axes_object.axvline(
+    x=marchenko_pastur_upper_bound, 
+    color="red", 
+    linestyle="dashed", 
+    linewidth=2, 
+    label="Marchenko-Pastur Upper Bound"
+)
+axes_object.set_title("Empirical Eigenvalue Distribution Versus Marchenko-Pastur Noise Bound")
+axes_object.set_xlabel("Eigenvalue Magnitude")
+axes_object.set_ylabel("Density (Logarithmic Scale)")
+axes_object.set_yscale("log")
+axes_object.legend()
+axes_object.grid(True, alpha=0.3)
+matplotlib.pyplot.show()
+
+
+
+"""
+Module 4: Optimal Sparse Hedging via Convex Control Optimization
+This module addresses your robust and low-turnover hedging requirements.
+We define a target security vector to be hedged and utilize the remaining matrix as potential candidate hedging instruments.
+By formulating the tracking error minimization as an Elastic Net regularized regression, the L1 penalty enforces strict sparsity (dropping collinear instruments to avoid high turnover) and the L2 penalty distributes non-zero weights smoothly.
+The resulting active weights form a mathematically robust optimal control strategy against the unhedged dispersion portfolio.
+"""
+import pandas
+import matplotlib.pyplot
+import sklearn.linear_model
+
+target_security_identifier = logarithmic_returns_dataframe.columns[0]
+target_security_returns_series = logarithmic_returns_dataframe[target_security_identifier]
+candidate_hedges_dataframe = logarithmic_returns_dataframe.drop(columns=[target_security_identifier])
+
+elastic_net_optimizer = sklearn.linear_model.ElasticNet(
+    alpha=0.005, 
+    l1_ratio=0.5, 
+    fit_intercept=True, 
+    max_iter=10000
+)
+
+elastic_net_optimizer.fit(candidate_hedges_dataframe.to_numpy(), target_security_returns_series.to_numpy())
+
+optimal_hedge_weights_series = pandas.Series(
+    elastic_net_optimizer.coef_, 
+    index=candidate_hedges_dataframe.columns
+)
+active_hedge_weights_series = optimal_hedge_weights_series[optimal_hedge_weights_series != 0].sort_values(key=abs, ascending=False)
+
+figure_object, axes_object = matplotlib.pyplot.subplots(figsize=(12, 6))
+active_hedge_weights_series.head(20).plot(kind="bar", color="darkorange", ax=axes_object)
+axes_object.set_title(f"Optimal Regularized Hedge Weights For Target Security {target_security_identifier}")
+axes_object.set_xlabel("Candidate Hedging Instrument Identifier")
+axes_object.set_ylabel("Allocation Weight Magnitude")
+axes_object.grid(axis="y", linestyle="--", alpha=0.7)
+matplotlib.pyplot.show()
