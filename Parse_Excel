@@ -34,12 +34,19 @@ class ExcelFormulaTracer:
         Safely extracts the formula string. This avoids the #VALUE! stoppage when parsing 
         Array Formulas or orphaned Shared Formulas that lack an explicit formula tag in the XML.
         """
-        # FIX: If passed a range string (e.g., 'A1:Z500'), default to the top-left cell 
-        # to prevent openpyxl from returning a tuple instead of a Cell object.
-        if ":" in cell_coord:
-            cell_coord = cell_coord.split(":")[0]
+        # --- THE FIX ---
+        # Normalize any range, full column (A:A), or full row (1:1) to its top-left cell 
+        # to guarantee openpyxl returns a single Cell object, never a tuple.
+        try:
+            min_col, min_row, _, _ = range_boundaries(cell_coord)
+            # If it's a full row/col, range_boundaries returns None for the missing axis. Default to 1.
+            safe_col = min_col if min_col is not None else 1
+            safe_row = min_row if min_row is not None else 1
+            safe_coord = f"{get_column_letter(safe_col)}{safe_row}"
+        except Exception:
+            safe_coord = cell_coord # Fallback for named ranges
 
-        cell = ws[cell_coord]
+        cell = ws[safe_coord]
         val = cell.value
 
         if isinstance(val, str) and val.startswith("="):
@@ -49,12 +56,14 @@ class ExcelFormulaTracer:
             return "=" + val.text.lstrip("=")
 
         # 1. Check if the cell lives inside an Array Formula block
-        coord_tuple = coordinate_to_tuple(cell_coord)
+        coord_tuple = coordinate_to_tuple(safe_coord)
         for master_coord, rng_str in getattr(ws, 'array_formulae', {}).items():
             try:
-                min_col, min_row, max_col, max_row = range_boundaries(rng_str)
-                if min_row <= coord_tuple[0] <= max_row and min_col <= coord_tuple[1] <= max_col:
-                    master_val = ws[master_coord].value
+                min_col_arr, min_row_arr, max_col_arr, max_row_arr = range_boundaries(rng_str)
+                if min_row_arr <= coord_tuple[0] <= max_row_arr and min_col_arr <= coord_tuple[1] <= max_col_arr:
+                    # Also safeguard the master_coord just in case it's stored as a range string
+                    safe_master = master_coord.split(":")[0] if ":" in master_coord else master_coord
+                    master_val = ws[safe_master].value
                     if hasattr(master_val, 'text') and master_val.text:
                         return "=" + master_val.text.lstrip("=")
                     elif isinstance(master_val, str) and master_val.startswith('='):
@@ -79,11 +88,12 @@ class ExcelFormulaTracer:
                     
                 if above_formula:
                     try:
-                        return Translator(above_formula, origin=above_coord).translate_formula(cell_coord)
+                        return Translator(above_formula, origin=above_coord).translate_formula(safe_coord)
                     except Exception:
                         pass
                         
         return val
+
 
     def parse_formula(self, formula_text, current_sheet):
         """Attempts to extract references using Tokenizer, falls back to Regex for modern formulas."""
