@@ -34,6 +34,11 @@ class ExcelFormulaTracer:
         Safely extracts the formula string. This avoids the #VALUE! stoppage when parsing 
         Array Formulas or orphaned Shared Formulas that lack an explicit formula tag in the XML.
         """
+        # FIX: If passed a range string (e.g., 'A1:Z500'), default to the top-left cell 
+        # to prevent openpyxl from returning a tuple instead of a Cell object.
+        if ":" in cell_coord:
+            cell_coord = cell_coord.split(":")[0]
+
         cell = ws[cell_coord]
         val = cell.value
 
@@ -263,13 +268,14 @@ class ExcelFormulaTracer:
         out_wb.save(output_path)
         print(f"Success! Output generated at: {output_path}")
 
-if __name__ == "__main__":
-    # --- UPDATE THESE ---
-    FILE_PATH = "pricing_model.xlsx" 
-    TARGET_TAB = "Interface_Tab" # Substitute for the actual tab name C138 is on
-    TARGET_CELL = "C138" 
-    OUTPUT_FILE = "Extracted_Logic_Tree.xlsx"
-    
-    tracer = ExcelFormulaTracer(FILE_PATH)
-    tree = tracer.build_tree(TARGET_TAB, TARGET_CELL)
-    tracer.export_results(tree, OUTPUT_FILE)
+
+# Update these constants with your actual file details
+FILE_PATH = "SET Generic Model Template.xlsm" 
+TARGET_TAB = "Outperformance(AsianBasket)"
+TARGET_CELL = "C138" 
+OUTPUT_FILE = "Outperformance_Tree.xlsx"
+
+tracer = ExcelFormulaTracer(FILE_PATH)
+tree = tracer.build_tree(TARGET_TAB, TARGET_CELL)
+# FIX: Method name changed from export_tree to export_results
+tracer.export_results(tree, OUTPUT_FILE)
