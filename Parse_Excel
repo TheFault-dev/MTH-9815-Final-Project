@@ -1,0 +1,214 @@
+import openpyxl
+from openpyxl.formula import Tokenizer
+from openpyxl.utils.cell import get_column_letter, range_boundaries
+
+class ExcelFormulaTracer:
+    def __init__(self, filepath):
+        print(f"Loading workbook: {filepath} (This might take a moment...)")
+        # data_only=False ensures we read the raw formulas (e.g., =A1+B1) and not cached evaluated values
+        self.wb = openpyxl.load_workbook(filepath, data_only=False)
+        self.sheet_names = self.wb.sheetnames
+        # Memoization cache to prevent exponential tree growth
+        self.global_visited = {}
+
+    def get_cell_name(self, ws, row, col):
+        """Attempts to heuristically extract a human-readable name from the cell to the left or above."""
+        name_left = ""
+        name_above = ""
+        try:
+            # 1. Check left
+            if col > 1:
+                val = ws.cell(row=row, column=col-1).value
+                if isinstance(val, str) and val.strip() and not val.startswith('='):
+                    name_left = val.strip()
+            # 2. Check directly above
+            if row > 1:
+                val = ws.cell(row=row-1, column=col).value
+                if isinstance(val, str) and val.strip() and not val.startswith('='):
+                    name_above = val.strip()
+        except Exception:
+            pass
+        
+        if name_left and name_above:
+            return f"{name_left} | {name_above}"
+        return name_left or name_above or ""
+
+    def parse_reference(self, ref_str, current_sheet):
+        """Splits a formula reference into its Sheet and Cell components."""
+        if "!" in ref_str:
+            sheet_part, cell_part = ref_str.rsplit("!", 1)
+            # Remove single quotes around sheet names if they exist
+            sheet_part = sheet_part.strip("'").replace("''", "'")
+            
+            # Catch references to external workbooks (e.g., [data.xlsx]Sheet1!A1)
+            if "[" in sheet_part and "]" in sheet_part:
+                sheet_part = sheet_part.split("]")[-1]
+                
+            return sheet_part, cell_part
+        return current_sheet, ref_str
+
+    def expand_range(self, range_str):
+        """Expands Excel ranges (e.g., A1:B2) into individual cell coordinate strings."""
+        range_str = range_str.replace('$', '')
+        if ":" not in range_str:
+            return [range_str]
+            
+        try:
+            min_col, min_row, max_col, max_row = range_boundaries(range_str)
+            # Catch infinite ranges like A:A or 1:1
+            if None in (min_col, max_col, min_row, max_row):
+                return [range_str] 
+                
+            # Cap expansion to avoid freezing the script on massive tables
+            if (max_row - min_row + 1) * (max_col - min_col + 1) > 200:
+                return [range_str] 
+                
+            cells = []
+            for row in range(min_row, max_row + 1):
+                for col in range(min_col, max_col + 1):
+                    cells.append(f"{get_column_letter(col)}{row}")
+            return cells
+        except Exception:
+            # Reaching here implies a Named Range or Table reference (e.g. Table1[Column1])
+            return [range_str]
+
+    def build_tree(self, sheet_name, cell_coord, depth=0, path=None):
+        """Recursively builds a tree of precedents."""
+        if path is None:
+            path = set()
+            
+        node_id = f"{sheet_name}!{cell_coord}"
+        
+        node = {
+            "sheet": sheet_name,
+            "cell": cell_coord,
+            "name": "",
+            "content": "",
+            "note": "",
+            "is_external_tab": False,
+            "children": [],
+            "depth": depth
+        }
+
+        # 1. Cycle detection (Prevents infinite loops if A1 -> B1 -> A1)
+        if node_id in path:
+            node["note"] = "Cycle Detected"
+            return node
+
+        # 2. Memoization (Prevents exponential tree explosion)
+        if node_id in self.global_visited:
+            cached_node = self.global_visited[node_id].copy()
+            cached_node["depth"] = depth
+            cached_node["children"] = [] # Do not expand children again
+            cached_node["note"] = "[Already Traced]"
+            return cached_node
+
+        if sheet_name not in self.sheet_names:
+            node["note"] = "External Workbook / Missing Tab"
+            node["is_external_tab"] = True
+            return node
+
+        ws = self.wb[sheet_name]
+        try:
+            min_col, min_row, _, _ = range_boundaries(cell_coord)
+            cell = ws.cell(row=min_row, column=min_col)
+            val = cell.value
+        except Exception:
+            node["note"] = "Named Range / Unbounded Range"
+            return node
+            
+        node["name"] = self.get_cell_name(ws, min_row, min_col)
+        node["content"] = str(val) if val is not None else ""
+
+        # Cache basic info before parsing precedents
+        self.global_visited[node_id] = node.copy()
+        path.add(node_id)
+
+        # 3. If the cell is a formula, parse it for precedents
+        if isinstance(val, str) and val.startswith("="):
+            try:
+                tok = Tokenizer(val)
+                for t in tok.items:
+                    # Look for explicit cell/range references
+                    if t.type == "OPERAND" and t.subtype == "RANGE":
+                        ref_sheet, ref_range = self.parse_reference(t.value, sheet_name)
+                        
+                        cells = self.expand_range(ref_range)
+                        for c in cells:
+                            child = self.build_tree(ref_sheet, c, depth + 1, path.copy())
+                            
+                            if ":" in c:
+                                child["note"] = "Range too large to trace individually"
+                                
+                            if ref_sheet != sheet_name:
+                                child["note"] = f"Precedent located in external tab ({ref_sheet})"
+                                child["is_external_tab"] = True
+                                
+                            node["children"].append(child)
+                            
+            except Exception as e:
+                node["note"] = f"Formula Parse Error"
+
+        return node
+
+    def export_tree(self, root, output_path):
+        """Flattens the graph and exports to a new Excel file."""
+        out_wb = openpyxl.Workbook()
+        ws = out_wb.active
+        ws.title = "Dependency Tree"
+        
+        headers = ["Tree View", "Level", "Is External Tab", "Sheet", "Cell", "Extracted Name", "Formula / Value", "Notes"]
+        ws.append(headers)
+        
+        # Make headers bold
+        for col in range(1, len(headers) + 1):
+            ws.cell(row=1, column=col).font = openpyxl.styles.Font(bold=True)
+        
+        def flatten(n, is_last=True, prefix=""):
+            rows = []
+            
+            # Format visual ASCII branch hierarchy
+            if n["depth"] == 0:
+                visual = f"[{n['cell']}] {n['name']}".strip()
+            else:
+                visual = prefix + ("└── " if is_last else "├── ") + f"[{n['cell']}] {n['name']}".strip()
+                
+            rows.append([
+                visual, n["depth"], n["is_external_tab"], n["sheet"], n["cell"],
+                n["name"], n["content"], n["note"]
+            ])
+            
+            children = n.get("children", [])
+            for i, child in enumerate(children):
+                new_prefix = prefix + ("    " if is_last else "│   ") if n["depth"] > 0 else ""
+                rows.extend(flatten(child, i == len(children) - 1, new_prefix))
+                
+            return rows
+
+        # Write flattened rows to sheet
+        for row in flatten(root):
+            ws.append(row)
+            
+        # Adjust column widths for readability
+        ws.column_dimensions['A'].width = 50
+        ws.column_dimensions['B'].width = 10
+        ws.column_dimensions['C'].width = 15
+        ws.column_dimensions['D'].width = 20
+        ws.column_dimensions['E'].width = 15
+        ws.column_dimensions['F'].width = 25
+        ws.column_dimensions['G'].width = 45
+        ws.column_dimensions['H'].width = 40
+            
+        out_wb.save(output_path)
+        print(f"Success! Exported long-table logic tree to: {output_path}")
+
+if __name__ == "__main__":
+    # Update these constants with your actual file details
+    FILE_PATH = "pricing_model.xlsx" 
+    TARGET_TAB = "Interface_Tab"
+    TARGET_CELL = "D10" 
+    OUTPUT_FILE = "Extracted_Logic_Tree.xlsx"
+    
+    tracer = ExcelFormulaTracer(FILE_PATH)
+    tree = tracer.build_tree(TARGET_TAB, TARGET_CELL)
+    tracer.export_tree(tree, OUTPUT_FILE)
