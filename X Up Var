@@ -1,0 +1,131 @@
+def load_settle_price_from_bbg(date: datetime.date, ticker: str, scale: bool = True) -> float:
+    """Load PX_SETTLE from Bloomberg. Assume blpapi and xbbg are installed."""
+    from xbbg import blp
+    import pandas as pd
+    
+    # Safely format BBG Ticker with the proper yellow key
+    bbg_ticker = ticker
+    if bbg_ticker == "SPX":
+        bbg_ticker = "SPX Index"
+    elif not (bbg_ticker.endswith("Index") or bbg_ticker.endswith("Equity")):
+        # Convert symbols like NEE-UN to NEE US Equity (Bloomberg mapping)
+        bbg_ticker = bbg_ticker.replace("-UN", " US").replace("-", " ") + " Equity"
+
+    try:
+        # Check if the requested date is today
+        if (isinstance(date, datetime.datetime) and date.date() == datetime.date.today()) or date == datetime.date.today():
+            # Use PX_LAST intraday as fallback, as PX_SETTLE might not be published yet
+            df = blp.bdp(tickers=bbg_ticker, flds=['PX_SETTLE', 'PX_LAST'])
+            if df is None or df.empty: 
+                return 0.0
+            
+            if 'px_settle' in df.columns and pd.notna(df['px_settle'].iloc[0]):
+                price = float(df['px_settle'].iloc[0])
+            elif 'px_last' in df.columns and pd.notna(df['px_last'].iloc[0]):
+                price = float(df['px_last'].iloc[0])
+            else:
+                return 0.0
+        else:
+            df = blp.bdh(tickers=bbg_ticker, flds=['PX_SETTLE'], start_date=date, end_date=date)
+            if df is None or df.empty: 
+                return 0.0
+            price = float(df.values[0][0])
+            
+        if scale:
+            unit_df = blp.bdp(tickers=bbg_ticker, flds=['QUOTE_UNITS'])
+            quote_unit = unit_df['quote_units'].iloc[0] if (unit_df is not None and not unit_df.empty and 'quote_units' in unit_df.columns) else ''
+        else:
+            quote_unit = ''
+            
+        return price * (0.01 if 'USd' in str(quote_unit) else 1.0)
+    except Exception as e:
+        print(f"BBG fetch failed for {bbg_ticker}: {e}")
+        return 0.0
+
+
+
+    # === FIXED STRIKE GENERATION (Divided percentage by 100.0) ===
+    fullStrikes = [(percentage_strike / 100.0) * spot for percentage_strike in range(70, 121, 10)] if uidx == 0 else [4000, 5000, 5700, 6400, 6800, 7500, 7800, 8600]
+    weights = np.ones(len(fullStrikes))
+
+    # ... (Keep your matrix zero allocations & clustering calls exactly as they are) ...
+    # DO NOT DELETE YOUR CLUSTERING BLOCK: `outputs = pymfl.MflArray.Map(...)`
+
+    # === REPLACE HEDGE LOGIC ===
+    import matplotlib.pyplot as plt
+    allextraw = np.zeros([npower, nstrikes])
+    
+    for kp in range(npower):
+        if kp == 0:
+            # Normalize risks for numerical stability to avoid scaling issues in least squares
+            thet = np.mean(np.abs(thetaY))
+            gam = np.mean(np.abs(gammaY))
+            veg = np.mean(np.abs(vegaY))
+            
+            # Prevent division by zero
+            if thet < 1e-12: thet = 1.0
+            if gam < 1e-12: gam = 1.0
+            if veg < 1e-12: veg = 1.0
+            
+            # --- SEQUENTIAL CASCADE HEDGE (Forward Substitution) ---
+            
+            # 1. Base Hedge: Start with the Standard Var Swap replication
+            # Setting extraw=1.0 across all strikes ensures the standard Vanilla 1/K^2 profile is maintained
+            extraw = np.ones(nstrikes)
+            
+            # 2. Identify downside Puts (strikes < spot) & sort DESCENDING (closest to spot first)
+            # Using 0.99 ensures we don't accidentally hedge the ATM strike and distort the center
+            put_indices = [j for j, k in enumerate(fullStrikes) if k < spot * 0.99]
+            put_indices.sort(key=lambda j: fullStrikes[j], reverse=True)
+            
+            # 3. Forward Substitution Loop (Hedge scenario by scenario downwards)
+            for j in put_indices:
+                put_strike = fullStrikes[j]
+                
+                # Identify the specific downside scenario/slide closest to this put strike.
+                # Because your strikes are set at 90%, 80%, 70%, this perfectly maps to the -10%, -20%, -30% scenarios.
+                i = np.argmin(np.abs(np.array(slides) - put_strike))
+                
+                # Target UpVar risks at this specific down-slide
+                target_theta = thetaY[i] / thet
+                target_gamma = gammaY[i] / gam
+                target_vega = vegaY[i] / veg
+                
+                # Current portfolio risks at this slide (Static strip + previously processed puts carried over)
+                current_theta = np.sum(thetaX[kp, i, :] * extraw) / thet
+                current_gamma = np.sum(gammaX[kp, i, :] * extraw) / gam
+                current_vega = np.sum(vegaX[kp, i, :] * extraw) / veg
+                
+                # Calculate the unhedged residual risk
+                res_theta = target_theta - current_theta
+                res_gamma = target_gamma - current_gamma
+                res_vega = target_vega - current_vega
+                
+                # Risk of the current put option being evaluated
+                put_theta = thetaX[kp, i, j] / thet
+                put_gamma = gammaX[kp, i, j] / gam
+                put_vega = vegaX[kp, i, j] / veg
+                
+                # 1D Least Squares to find the weight adjustment matching residual Theta, Gamma, and Vega
+                denominator = put_theta**2 + put_gamma**2 + put_vega**2
+                if denominator > 1e-12:
+                    weight_adj = (res_theta * put_theta + res_gamma * put_gamma + res_vega * put_vega) / denominator
+                    extraw[j] += weight_adj
+                    print(f"Scenario Drop mapped to Strike {put_strike:.2f}: Added Put weight adjustment of {weight_adj:.4f}")
+            
+            # Store the resulting weights for the full hedge
+            allextraw[kp, :] = extraw
+        else:
+            # Safely locate the spot position without raising a ValueError for inexact floats
+            widx = np.argmin(np.abs(np.array(slides) - spot))
+            
+            # Replaced len(clf.coef_) with nstrikes since Lasso is removed
+            denom = thetaX[kp, :, :].sum(axis=1)[widx]
+            if abs(denom) > 1e-12:
+                allextraw[kp,:] = np.ones(nstrikes) * thetaY[widx] / denom
+            else:
+                allextraw[kp,:] = np.ones(nstrikes)
+
+        # Plotting code remains identically intact below this line
+        fig = plt.figure()
+
