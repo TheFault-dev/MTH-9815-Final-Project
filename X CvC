@@ -1,0 +1,153 @@
+import re
+import datetime as dt
+
+def parse_broker_quote(text: str) -> str:
+    matches = re.findall(r'\[(.*?)\]', text)
+    data = {matches[i].strip(): matches[i+1].strip() for i in range(0, len(matches), 2) if i + 1 < len(matches)}
+    
+    expiry_str = data.get("Expiry", "")
+    if expiry_str:
+        expiry_date = dt.datetime.strptime(expiry_str, "%d%m%Y")
+        expiry_fmt = expiry_date.strftime("%d%b%y")
+    else:
+        expiry_fmt = ""
+        
+    participation = data.get("IndivWeight", "100%")
+    strike = data.get("Strike", "ATM")
+    
+    total_legs = int(data.get("TotalLegs", "0"))
+    tickers = "/".join(data.get(f"Leg{i}", "") for i in range(1, total_legs + 1))
+    
+    otype = "PvP" if "Put" in data.get("ProductType", "") else "CvC"
+    ccy = data.get("QuantoCurrency", "USD")
+    bid = data.get("Bid", "")
+    ask = data.get("Ask", "")
+    
+    pricing_date = dt.date.today().strftime("%d%b%y")
+    
+    return f"{pricing_date} {expiry_fmt} {participation} {tickers} {strike} {otype} {ccy}: {bid} at {ask}"
+
+# --- Testing the parser ---
+broker_text = """
+[ProductType]           [Put vs Put] 
+[Expiry]                       [17062027] 
+[Strike]                        [90%] 
+[IndivWeight]             [90%] 
+[TotalLegs]                 [3] 
+[Leg1]                          [AAPL.OQ] 
+[Leg2]                          [MSFT.OQ] 
+[Leg3]                          [NVDA.OQ] 
+[QuantoCurrency]                               [USD] 
+[Bid]    [1%] 
+[Ask]                            [1.3%] 
+"""
+
+parsed_quote = parse_broker_quote(broker_text)
+print(f"Parsed Quote String:\n{parsed_quote}")
+
+
+
+
+MANUAL_RE = re.compile(
+    r"^"
+    # ─── optional leading pricing‐date ──────────────────────────────────
+    r"(?:(?P<p_dd>\d{1,2})(?P<p_mon>[A-Za-z]{3})(?P<p_yy>\d{2})\s+)?"
+    # ─── expiry date ────────────────────────────────────────
+    r"(?P<dd>\d{1,2})(?P<mon>[A-Za-z]{3})(?P<yy>\d{2})\s+"
+     # ─── optional participation rate, e.g. "90%"  ──────── 
+    r"(?:(?P<participation>\d+)%\s+)?"
+    r"(?P<tickers>[A-Za-z0-9/\.-]+)\s+"
+    r"(?P<mony>\d+%|ATM)\s+"
+    r"(?P<otype>CvC|PvP)\s+"
+    r"(?P<ccy>[A-Za-z]{3}):\s*"
+    r"(?P<bid>[0-9.]+%?)\s+at\s+(?P<ask>[0-9.]+%?)"
+    r"$"
+)
+
+
+
+def parse_csv_row(row: pd.Series) -> Dict:
+    """Parses a row from the input CSV into a dictionary of parameters."""
+    quote_string = str(row["Quote"]).strip("'\" ")
+    return parse_manual_quote(quote_string)
+
+
+        elif args.mode == "csv":
+            df_raw = pd.read_csv(args.path)
+            parsed_data = [parse_csv_row(row) for _, row in df_raw.iterrows()]
+            df_parsed = pd.DataFrame(parsed_data)
+            
+            results = []
+            print(f"Processing {len(df_parsed)} rows from {args.path}...")
+            
+            for i, row in df_parsed.iterrows():
+                print(f"  Processing row {i+1}...")
+                curve = Curve(pricing_date=row['pricing_date'], currency=row['currency'])
+                
+                weight = 1.0 / len(row['tickers'])
+                legs = [
+                    Ticker(curve, model_params, ticker, row['expiry'], row['option_type'], 1.0, row['strike'], weight, row['participation_rate'])
+                    for ticker in row['tickers']
+                ]
+                basket = Basket(tickers=legs, bid=row['bid'], ask=row['ask'], strike=row['strike'], option_type=row['option_type'])
+                implied_corr_res = basket.implied_correlation()
+                results.append({
+                    "pricing_date": row['pricing_date'], "expiry": row['expiry'],
+                    "pair": "/".join(row['tickers']), "option_type": row['option_type'].value,
+                    "strike": row['strike'], "bid_premium": row['bid'], "ask_premium": row['ask'],
+                    "implied_corr_bid": implied_corr_res['bid'], "implied_corr_ask": implied_corr_res['ask'],
+                })
+
+            df_results = pd.DataFrame(results)
+            df_results.to_csv(args.output, index=False)
+            print(df_results.head(5))
+            print("\n--- End of Sampled Output ---")
+            print(f"\nResults saved to {args.output}")
+            
+
+            if args.plot:
+                df_results['implied_corr'] = df_results[['implied_corr_bid', 'implied_corr_ask']].values.tolist()
+                output_prefix = os.path.splitext(args.output)[0]
+                generate_plots(df_results, output_prefix)
+
+
+
+import pandas as pd
+
+# 1. Provide quotes exactly formatted for the new "Quote" format. 
+# You can freely append elements resulting from `parse_broker_quote()` here as well.
+test_quotes = [
+    {"Quote": "10Mar26 17Jun27 80% QCOM-UQ/PLTR-UQ/NVDA-UQ/AAPL-UQ/META-UQ/AMZN-UQ ATM CvC USD: 0.50% at 0.80%"},
+    {"Quote": "10Mar26 17Jun27 90% NVDA-UQ/AVGO-UQ/AAPL-UQ/META-UQ/AMZN-UQ/MSFT-UQ ATM CvC USD: 1.65% at 1.65%"},
+    {"Quote": parse_broker_quote(broker_text)}
+]
+
+df_raw = pd.DataFrame(test_quotes)
+
+# 2. Iterate parsing directly into PyMFL loop execution 
+parsed_data = [parse_csv_row(row) for _, row in df_raw.iterrows()]
+df_parsed = pd.DataFrame(parsed_data)
+
+results = []
+for i, row in df_parsed.iterrows():
+    print(f"Evaluating Quote {i+1}...")
+    curve = Curve(pricing_date=row['pricing_date'], currency=row['currency'])
+    weight = 1.0 / len(row['tickers'])
+    
+    legs = [
+        Ticker(curve, model, ticker, row['expiry'], row['option_type'], 1.0, row['strike'], weight, row['participation_rate'])
+        for ticker in row['tickers']
+    ]
+    
+    basket = Basket(tickers=legs, bid=row['bid'], ask=row['ask'], strike=row['strike'], option_type=row['option_type'])
+    implied_corr_res = basket.implied_correlation()
+    
+    results.append({
+        "tickers": "/".join(row['tickers']),
+        "implied_corr_bid": implied_corr_res['bid'],
+        "implied_corr_ask": implied_corr_res['ask']
+    })
+
+print("\n--- End of Execution Validation ---")
+display(pd.DataFrame(results))
+
