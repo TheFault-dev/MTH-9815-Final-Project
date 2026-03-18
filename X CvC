@@ -113,41 +113,42 @@ def parse_csv_row(row: pd.Series) -> Dict:
 
 
 import pandas as pd
+import argparse
 
-# 1. Provide quotes exactly formatted for the new "Quote" format. 
-# You can freely append elements resulting from `parse_broker_quote()` here as well.
+# Initialize environment and model parameters using your existing functions
+mfl_dir = r"C:\Temp\MFL\CmProd_16.6.6_16.6.6\Output"
+init_mfl(mfl_dir)
+model = get_model_parameters()
+
+print("--- Testing Manual Mode CLI Simulation ---")
+manual_args = argparse.Namespace(
+    mode="manual",
+    quote="10Mar26 17Jun27 80% QCOM-UQ/PLTR-UQ/NVDA-UQ/AAPL-UQ/META-UQ/AMZN-UQ ATM CvC USD: 0.50% at 0.80%"
+)
+run_command(manual_args, model)
+
+
+print("\n--- Testing CSV Mode CLI Simulation ---")
 test_quotes = [
     {"Quote": "10Mar26 17Jun27 80% QCOM-UQ/PLTR-UQ/NVDA-UQ/AAPL-UQ/META-UQ/AMZN-UQ ATM CvC USD: 0.50% at 0.80%"},
     {"Quote": "10Mar26 17Jun27 90% NVDA-UQ/AVGO-UQ/AAPL-UQ/META-UQ/AMZN-UQ/MSFT-UQ ATM CvC USD: 1.65% at 1.65%"},
-    {"Quote": parse_broker_quote(broker_text)}
+    {"Quote": "10Mar26 17Jun27 80% QCOM-UQ/PLTR-UQ/NVDA-UQ/AAPL-UQ/META-UQ/AMZN-UQ ATM CvC USD: 0.50% at 0.70%"},
+    {"Quote": "10Mar26 17Jun27 80% QCOM-UQ/PLTR-UQ/NVDA-UQ/AAPL-UQ/META-UQ/AMZN-UQ ATM CvC USD: 0.55% at 0.70%"}
 ]
 
-df_raw = pd.DataFrame(test_quotes)
+test_input_path = "jupyter_test_quotes_input.csv"
+test_output_path = "jupyter_test_quotes_output.csv"
 
-# 2. Iterate parsing directly into PyMFL loop execution 
-parsed_data = [parse_csv_row(row) for _, row in df_raw.iterrows()]
-df_parsed = pd.DataFrame(parsed_data)
+pd.DataFrame(test_quotes).to_csv(test_input_path, index=False)
 
-results = []
-for i, row in df_parsed.iterrows():
-    print(f"Evaluating Quote {i+1}...")
-    curve = Curve(pricing_date=row['pricing_date'], currency=row['currency'])
-    weight = 1.0 / len(row['tickers'])
-    
-    legs = [
-        Ticker(curve, model, ticker, row['expiry'], row['option_type'], 1.0, row['strike'], weight, row['participation_rate'])
-        for ticker in row['tickers']
-    ]
-    
-    basket = Basket(tickers=legs, bid=row['bid'], ask=row['ask'], strike=row['strike'], option_type=row['option_type'])
-    implied_corr_res = basket.implied_correlation()
-    
-    results.append({
-        "tickers": "/".join(row['tickers']),
-        "implied_corr_bid": implied_corr_res['bid'],
-        "implied_corr_ask": implied_corr_res['ask']
-    })
+csv_args = argparse.Namespace(
+    mode="csv",
+    path=test_input_path,
+    output=test_output_path,
+    plot=False
+)
+run_command(csv_args, model)
 
-print("\n--- End of Execution Validation ---")
-display(pd.DataFrame(results))
-
+print("\n--- Verifying Output CSV ---")
+results_df = pd.read_csv(test_output_path)
+print(results_df)
