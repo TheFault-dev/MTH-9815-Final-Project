@@ -152,3 +152,146 @@ run_command(csv_args, model)
 print("\n--- Verifying Output CSV ---")
 results_df = pd.read_csv(test_output_path)
 print(results_df)
+
+
+# single quote mode as midstream task handler
+
+def price_single_quote(quote_string: str, model_params: dict) -> dict:
+    q = parse_manual_quote(quote_string)
+    num_assets = len(q["tickers"])
+    weight = 1.0 / num_assets
+    
+    curve = Curve(pricing_date=q["pricing_date"], currency=q["currency"])
+    legs = [Ticker(curve, model_params, idx, q["expiry"], q["option_type"], 1.0, q["strike"], weight, q["participation_rate"]) for idx in q["tickers"]]
+    basket = Basket(tickers=legs, bid=q["bid"], ask=q["ask"], strike=q["strike"], option_type=q["option_type"])
+    
+    return basket.implied_correlation()
+
+        if args.mode == "manual" or not args.mode:
+            implied_corr = price_single_quote(args.quote, model_params)
+            print("\n--- Results ---")
+            print(f"Quote: '{args.quote}'")
+            print(f"Implied Bid Correlation: {implied_corr['bid']:.4%}")
+            print(f"Implied Ask Correlation: {implied_corr['ask']:.4%}")
+
+# email inbound/outbound
+
+import time
+import win32com.client
+from quote_parser import parse_broker_quote
+from CvC_pricer import init_mfl, get_model_parameters, price_single_quote
+
+MFL_DIRECTORY = r"C:\Temp\MFL\CmProd_16.6.6_16.6.6\Output" 
+OUTLOOK_FOLDER = "BrokerQuotes"
+DESK_EMAIL = "desk@yourcompany.com"
+POLL_INTERVAL = 60
+
+def process_inbox(outlook, model_params):
+    namespace = outlook.GetNamespace("MAPI")
+    inbox = namespace.GetDefaultFolder(6) 
+    target_folder = inbox.Folders.Item(OUTLOOK_FOLDER)
+    
+    unread_messages = target_folder.Items.Restrict("[UnRead] = True")
+    
+    for msg in unread_messages:
+        print(f"\nProcessing new quote from {msg.SenderName}: {msg.Subject}")
+        
+        quote_str = parse_broker_quote(msg.Body)
+        implied_corr = price_single_quote(quote_str, model_params)
+        
+        reply = outlook.CreateItem(0)
+        reply.To = DESK_EMAIL
+        reply.Subject = f"Pricing Result: {msg.Subject}"
+        reply.Body = (
+            f"--- Automated Pricing Results ---\n\n"
+            f"Parsed Quote: {quote_str}\n"
+            f"Implied Bid Correlation: {implied_corr['bid']:.4%}\n"
+            f"Implied Ask Correlation: {implied_corr['ask']:.4%}\n"
+        )
+        reply.Send()
+        print(f"Successfully sent results to {DESK_EMAIL}.")
+        
+        msg.UnRead = False
+
+if __name__ == "__main__":
+    init_mfl(MFL_DIRECTORY)
+    model = get_model_parameters()
+    outlook_app = win32com.client.Dispatch("Outlook.Application")
+    
+    print(f"Listening for unread emails in Inbox\\{OUTLOOK_FOLDER}...")
+    while True:
+        process_inbox(outlook_app, model)
+        time.sleep(POLL_INTERVAL)
+
+
+# test matching implied correlations 
+
+import pandas as pd
+from scipy import optimize
+
+class PairwiseBasket(Basket):
+    def get_price_for_matrix(self, corr_matrix: list) -> float:
+        asset_data = []
+        for i, t in enumerate(self.tickers):
+            asset_data.append({
+                "Price": t.initial_fixing_price * t.spot_multiplier,
+                "CurrencySymbol": t.curve.currency, "Symbol": t.index,
+                "Volatility": t.vol_surface, "Dividend": t.dividend,
+                "ForecastCurveSymbol": "Forecast", "Correlations": corr_matrix[i]
+            })
+            
+        ctxt = {
+            "ValueDate": self.curve.pricing_date,
+            "AssetData": asset_data,
+            "CurrencyData": [{"Name": self.curve.currency, "CurveData": [{"Name": "Forecast"}]}],
+            "ModelParameters": self.model,
+            "Product": {
+                "AnalyticType": "MM3Beisser", "PayoffType": self.option_type.value,
+                "CurrencySymbol": self.curve.currency, "FaceValue": 1,
+                "Participation": 1, "PercentageStrike": self.strike,
+                "GuaranteedPercentage": 0, "InceptionDate": self.curve.pricing_date,
+                "MaturityDate": self.expiry, "Schedule": [self.expiry],
+                "BasketItems": [{"UnderlyingSymbol": t.index, "Weight": t.weight, "InitialFixing": t.initial_fixing_price} for t in self.tickers]
+            }
+        }
+        ctx_temp = _equity.AsianBasket_Contextualize_Temp(ctxt=ctxt, forecasts=[[self.curve.discount_curve_object]], discount=self.curve.discount_curve_object)
+        return -_pymfl.MarketResult(_equity.AsianBasket_Valuation(ctx_temp)).Pv()
+
+raw_quote = '18Mar26 17Jun27 90% NVDA-UQ/AVGO-UQ/AAPL-UQ/META-UQ/AMZN-UQ/MSFT-UQ ATM CvC USD'
+q = parse_manual_quote(f"{raw_quote}: 0% at 0%")
+
+pairs_data = {
+    ('AAPL-UQ', 'AMZN-UQ'): 0.555, ('AAPL-UQ', 'AVGO-UQ'): 0.568, ('AAPL-UQ', 'META-UQ'): 0.464,
+    ('AAPL-UQ', 'MSFT-UQ'): 0.550, ('AAPL-UQ', 'NVDA-UQ'): 0.565, ('AMZN-UQ', 'AVGO-UQ'): 0.601,
+    ('AMZN-UQ', 'META-UQ'): 0.642, ('AMZN-UQ', 'MSFT-UQ'): 0.669, ('AMZN-UQ', 'NVDA-UQ'): 0.617,
+    ('AVGO-UQ', 'META-UQ'): 0.563, ('AVGO-UQ', 'MSFT-UQ'): 0.635, ('AVGO-UQ', 'NVDA-UQ'): 0.689,
+    ('META-UQ', 'MSFT-UQ'): 0.674, ('META-UQ', 'NVDA-UQ'): 0.602, ('MSFT-UQ', 'NVDA-UQ'): 0.683
+}
+
+def get_corr(t1, t2):
+    if t1 == t2: 
+        return 1.0
+    return pairs_data.get((t1, t2)) or pairs_data.get((t2, t1))
+
+tickers = q["tickers"]
+corr_matrix = [[get_corr(t1, t2) for t2 in tickers] for t1 in tickers]
+
+curve = Curve(pricing_date=q["pricing_date"], currency=q["currency"])
+weight = 1.0 / len(tickers)
+legs = [Ticker(curve, model, idx, q["expiry"], q["option_type"], 1.0, q["strike"], weight, q["participation_rate"]) for idx in tickers]
+
+basket = PairwiseBasket(tickers=legs, bid=0, ask=0, strike=q["strike"], option_type=q["option_type"])
+
+target_basket_leg_price = basket.get_price_for_matrix(corr_matrix)
+
+def price_diff(corr):
+    return basket._get_price_for_correlation(corr) - target_basket_leg_price
+
+equivalent_flat_corr = optimize.root_scalar(price_diff, bracket=[-0.999, 0.999], method='brentq').root
+
+print("--- Pairwise Override Results ---")
+print(f"Matrix-Implied Basket Leg Price: {target_basket_leg_price:.6f}")
+print(f"Equivalent Flat Implied Correlation: {equivalent_flat_corr:.4%}")
+
+
+
