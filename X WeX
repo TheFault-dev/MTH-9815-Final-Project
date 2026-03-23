@@ -757,3 +757,31 @@ if __name__ == "__main__":
     
     run_variance_swap_hedge(args.ticker, e_date, args.vega, args.swap_type, args.out_folder, args.s, valuation_date=v_date)
 
+
+def get_bbg_strikes(ticker: str, expiry_date: datetime.date, valuation_date: datetime.date):
+    bbg_ticker = f"{ticker} Index" if ticker == "SPX" else f"{ticker} US Equity"
+    
+    # Format the expiry date for the Bloomberg override
+    bbg_exp = expiry_date.strftime("%Y%m%d")
+    
+    if valuation_date == datetime.date.today():
+        spot = blp.bdp(bbg_ticker, 'PX_LAST').iloc[0, 0]
+        # ADDED: CHAIN_EXP_DT_OVRD prevents row limit truncation
+        chain = blp.bds(bbg_ticker, 'OPT_CHAIN', CHAIN_EXP_DT_OVRD=bbg_exp)
+    else:
+        is_index = (ticker == "SPX")
+        spot_ticker = ticker.replace('-', ' ')
+        spot = load_price_from_cmdb(valuation_date, [spot_ticker], 'BLOOMBERG', 'SETTLE', is_index)[0]
+        val_date_str = valuation_date.strftime("%Y%m%d")
+        # ADDED: CHAIN_EXP_DT_OVRD prevents row limit truncation
+        chain = blp.bds(bbg_ticker, 'OPT_CHAIN', SINGLE_DATE_OVERRIDE=val_date_str, CHAIN_EXP_DT_OVRD=bbg_exp)
+        
+    exp_str = expiry_date.strftime("%m/%d/%y")
+    col_name = chain.columns[0]
+    
+    chain = chain[chain[col_name].str.contains(exp_str, na=False)]
+    strikes = chain[col_name].str.extract(r'[CP](\d+(?:\.\d+)?)').astype(float)[0].dropna().unique()
+    strikes = np.sort(strikes)
+    
+    return strikes[(strikes >= spot * 0.2) & (strikes <= spot * 3.0)]
+
