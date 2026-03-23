@@ -452,3 +452,306 @@ test_batch.to_csv(r"C:\temp\results\run_batch.csv", index=False)
 
 # 2. Call the module through Jupyter terminal execution
 !python var_swap_cli.py --csv "C:\temp\results\run_batch.csv" --out_folder "C:\temp\results" -s
+
+
+
+
+
+
+import os
+import xml.etree.cElementTree as ET
+import datetime
+import math
+import numpy as np
+import pandas as pd
+import time
+import argparse
+import urllib.request
+from xbbg import blp
+from sklearn import linear_model
+
+url = 'http://repo.mfl-info.bmogc.net/files/bmoca.crt'
+if not os.path.exists("C:\\Temp\\bmoca.crt"):
+    os.makedirs("C:\\Temp", exist_ok=True)
+    urllib.request.urlretrieve(url , "C:\\Temp\\bmoca.crt")
+
+import pymfl_setup
+pymfl_setup.start_mfl(pymfl_setup.registered_mfl(), True)
+import pymfl
+from pymfl.translator import translate
+from Mfl.Service import Factory
+from Mfl.DbTools.Cmdb import InstrumentLookup
+
+from wex_export import generate_wex_spreadsheet
+
+CMDB_OPTIONS = {'Matching': 'blank_when_unmatched'}
+
+def define_support(directory: str) -> int:
+    file_name = os.path.join(directory, '..', 'Configs', 'MflConfig.xml')
+    if not os.path.exists(file_name): return 8
+    root = ET.parse(file_name).getroot()
+    support_num = root.find('.//SupportNum')
+    if support_num is None: return 8
+    return int(support_num.text)
+
+def init_mfl(directory: str) -> None:
+    import pymfl_setup
+    pymfl_setup.start_mfl(directory, False)
+    support_num = define_support(directory)
+    local_app_data = os.environ['LOCALAPPDATA']
+    pkgs = os.path.join(local_app_data, 'MFL', 'pkgs', f'support{support_num}', 'x64')
+    os.environ['PATH'] = pkgs + os.pathsep + os.environ['PATH']
+
+def load_price_from_cmdb(date: datetime.date, tickers: list, symbology: str, label: str, is_index: bool = False) -> list:
+    quotes_load = translate(pymfl.Quotes().Load(CMDB_OPTIONS, date, label, None, None, None, None, None, 'MID' if is_index else 'BID/OFFER/LAST/VOLUME/OPEN INTEREST', None, pymfl.Securities().ByDatedTicker(date, symbology, tickers)))
+    return list(quotes_load['VALUE1' if is_index else 'VALUE3'])
+
+def generate_contexts(ticker, valuation_date, expiry_date, vega_notional, swap_type):
+    calendar = pymfl.Dates().calendar("NYSE")
+    paylag = 2
+    maturity_date = pymfl.Calendar.addBusDays(calendar, expiry_date, paylag, True)
+    option_type = 'Call'
+    currency = 'USD'
+    ir_curve_name = 'USD_SOFR'
+    is_live_curve = valuation_date == datetime.date.today()
+    ir_curve = pymfl.Equities().LoadIrCurve(valuation_date, ir_curve_name, is_live_curve, None)
+
+    symbology = 'BLOOMBERG'
+    quote_label = 'SETTLE'
+    dividend_label = 'NA CLOSE'
+    is_index = ticker == "SPX"
+    spot_ticker = ticker.replace('-',' ')
+    
+    # DECISION: Bypass CMDB for spot if valuing today to prevent null/stale data
+    if valuation_date == datetime.date.today():
+        bbg_ticker = f"{ticker} Index" if is_index else f"{ticker} US Equity"
+        spot_price = blp.bdp(bbg_ticker, 'PX_LAST').iloc[0, 0]
+    else:
+        spot_price = load_price_from_cmdb(valuation_date, [spot_ticker], symbology, quote_label, is_index)[0]
+        
+    strike = spot_price
+    
+    div_cmdb = pymfl.CMDB().LoadDividends(dividend_label, ticker, valuation_date, {'map': symbology, 'useDates': True, 'pivotColumn': 'div_type'})
+    dividend_schedule = pymfl.EquityUtilities().DvdArrayFromDBQuery(div_cmdb)
+    forward = pymfl.Dividend().ForwardPrice(dividend_schedule, ir_curve, expiry_date, valuation_date, spot_price, None, None, None, None, None, None, None)
+    
+    vol_label = 'NA CLOSE'
+    vol_load_options = {'map': symbology, 'useDates': True, 'Mid': True}
+    vol_cmdb = pymfl.CMDB().LoadVolatilities(vol_label, ticker, valuation_date, vol_load_options)
+    vol_surface = pymfl.EquityUtilities().VolArrayFromDBQuery(vol_cmdb)
+
+    pf = pymfl.Securities().ByTicker("Bloomberg Equity", None, [ticker])
+    inputOpt = {"p_date": valuation_date, "p_label": "NA CLOSE", "p_instance": "latest", "p_filter": pf}
+    vcb_rn = pymfl.Request(None).Create("eq.query","vcb")
+    vcb = pymfl.Request(vcb_rn).ByName(inputOpt)
+    vcb_ticker = translate(pymfl.Dict(vcb).Item(ticker))
+    vcb_dict = {'VolDate': vcb_ticker["VOL_DATE"], 'VolSpot': 100.0, 'TenorParameters': sorted(vcb_ticker["TENOR_PARAMETERS"], key=lambda x: x['Term'])}
+
+    input_svi = {"p_date": valuation_date, "p_label": "NA CLOSE", "p_instance": "latest", "query": "svi", "p_filter": pf}
+    svi_rn = pymfl.Request(None).Create("eq.query","svi")
+    svi_obj = pymfl.Request(svi_rn).ByName(input_svi)
+    svi_ticker = (pymfl.Dict(svi_obj).Item(ticker))
+    svi_params = pymfl.EquityUtilities().SVIParametersFromDBQuery(svi_ticker)
+
+    product = {
+        'PercentStrike': 1.0, 'CurrencySymbol': 'USD', 'InceptionDate': valuation_date,
+        'ExpiryDate': expiry_date, 'MaturityDate': maturity_date, 'Payoff': option_type,
+        'FaceValue': strike, 'ExerciseType': 'European', 'InitialFixing': strike,
+    }
+    asset_data = {
+        "Volatility": vol_surface, 'CurrencySymbol': currency, 'Dividend': dividend_schedule,
+        'Price': spot_price, 'ForecastCurveSymbol': 'Discount', 'Symbol': ticker, 'SVIParameters': svi_params
+    }
+    currency_data = [{'Name': currency, 'CurveData': [{'Name': 'Discount'}]}]
+    
+    model_parameters = {
+        'VERSION': '20160613', 'PricingMethod': 'Binomial', 'PricingBinomialSteps': -500,
+        'SeparateThetaAndCarry': True, 'IsForwardGreeks': False, 'ThetaSpotType': 'ConstantDiv',
+        'ThetaCurveType': 'ConstantRate', 'CalibrationMethod': 'SVI',
+        'SVIParameters': pymfl.SVIUtilities().GetSVIParams("ReFitExtreme"),
+        'DeltaTweak': [0.001, 0.001], 'AbsoluteVegaTweak': 0.01, 'PhiTweak': 0.01, 'ThetaTweak': 1.0, 'VegaType': 'Single'
+    }
+    
+    context_dict = {'Product': product, 'AssetData': asset_data, 'CurrencyData': currency_data, 'ValueDate': valuation_date, 'ModelParameters': model_parameters}
+    context = pymfl.Equities().ApplyRecommendedModelParameters(pymfl.Equities().European_Contextualize_Temp(context_dict, [[ir_curve]], ir_curve))
+
+    vs_asset_data = {
+        "Volatility": vol_surface, 'CurrencySymbol': currency, 'Dividend': dividend_schedule,
+        'Price': spot_price, 'ForecastCurveSymbol': 'Discount', 'Symbol': ticker,
+        "VolConvexityBasis": vcb_dict, 'SVIParameters': svi_params 
+    }
+    
+    schedule_dates = pymfl.Dates().businessDates(valuation_date, expiry_date, calendar)
+    schedule = [{"Date": x, "Fixing": None} for x in schedule_dates]
+    schedule[0]["Fixing"] = spot_price
+    
+    vs_product = {
+        'CurrencySymbol': 'USD', 'InceptionDate': valuation_date, 'MaturityDate': maturity_date,
+        'PayoffType': swap_type, 'TriggerType': 'Corridor', 'TriggerStyle': 'KnockOut',
+        'VolatilityStrike': 21.0, 'VarianceUnits': vega_notional, 'UseDiscrete': False,
+        'AnnualizationFactor': 252.0, 'Schedule': schedule, 'TriggerDay': 'Both', 'VERSION': '20141022'
+    }
+    
+    vs_context_dict = {'Product': vs_product, 'AssetData': vs_asset_data, 'CurrencyData': currency_data, 'ValueDate': valuation_date, 'ModelParameters': model_parameters}
+    vs_context = pymfl.Equities().ApplyRecommendedModelParameters(pymfl.Equities().VarianceSwap_Contextualize_Temp(vs_context_dict, [[ir_curve]], ir_curve))
+    
+    discount_rule = "{ModelParameters.{Discount=x}}"
+    volstrike_rule = "{Product.{VolatilityStrike=x}}"
+    unit_rule = "{Product.{VarianceUnits=x}}"
+    no_discount_ctxt = pymfl.MflData().SetProperty(vs_context, discount_rule, False)
+    no_strike_ctxt = pymfl.MflData().SetProperty(pymfl.MflData().SetProperty(vs_context, discount_rule, False), volstrike_rule, 0.0)
+    
+    v0 = pymfl.Equities().PV(no_discount_ctxt)
+    v1 = pymfl.Equities().PV(no_strike_ctxt)
+    fair_strike = v1 / vega_notional if swap_type == "Volatility" else np.sqrt(v1 / vega_notional)
+    fair_units = vega_notional if swap_type == "Volatility" else vega_notional / (2.0 * fair_strike)
+    vs_context = pymfl.MflData().SetProperty(pymfl.MflData().SetProperty(vs_context, volstrike_rule, fair_strike), unit_rule, fair_units)
+
+    return context, vs_context
+
+def get_bbg_strikes(ticker: str, spot: float, expiry_date: datetime.date, valuation_date: datetime.date):
+    bbg_ticker = f"{ticker} Index" if ticker == "SPX" else f"{ticker} US Equity"
+    
+    if valuation_date == datetime.date.today():
+        chain = blp.bds(bbg_ticker, 'OPT_CHAIN')
+    else:
+        val_date_str = valuation_date.strftime("%Y%m%d")
+        chain = blp.bds(bbg_ticker, 'OPT_CHAIN', SINGLE_DATE_OVERRIDE=val_date_str)
+        
+    exp_str = expiry_date.strftime("%m/%d/%y")
+    col_name = chain.columns[0]
+    
+    chain = chain[chain[col_name].str.contains(exp_str, na=False)]
+    strikes = chain[col_name].str.extract(r'[CP](\d+(?:\.\d+)?)').astype(float)[0].dropna().unique()
+    strikes = np.sort(strikes)
+    
+    return strikes[(strikes >= spot * 0.2) & (strikes <= spot * 3.0)]
+
+def calculate_trapezoidal_weights(strikes: np.ndarray, swap_type: str):
+    n = len(strikes)
+    weights = np.zeros(n)
+    
+    # DECISION: Power logic directly drives file naming convention later
+    k_power = 1 if swap_type == "Volatility" else 0
+    
+    for i in range(n):
+        K = strikes[i]
+        if i == 0:
+            dK = strikes[1] - strikes[0]
+        elif i == n - 1:
+            dK = strikes[n-1] - strikes[n-2]
+        else:
+            dK = (strikes[i+1] - strikes[i-1]) / 2.0
+            
+        weights[i] = (dK / (K ** 2)) * (K ** k_power)
+        
+    return weights, k_power
+
+def run_variance_swap_hedge(underlyings, expiry_date, vega_notional, swap_type, outputfolder, generate_wex, valuation_date=None):
+    if valuation_date is None:
+        valuation_date = datetime.date.today()
+        
+    os.makedirs(outputfolder, exist_ok=True)
+    payoffRule = "{Product.{Payoff=x}}"
+    percentStrikeRule = "{Product.{PercentStrike=x}}"
+    spotRule = "{AssetData.{Price=x}}"
+    fixingRule = "{Product.{Schedule[0].{Fixing=x}}}"
+
+    for thisu in underlyings:
+        print(f"\nProcessing: {thisu}")
+        vanilla, volswap = generate_contexts(thisu, valuation_date, expiry_date, vega_notional, swap_type)
+        
+        vanilla = pymfl.MflData().SetProperty(pymfl.MflData().SetProperty(pymfl.MflData().SetProperty(vanilla,"{ModelParameters.{PricingMethod=x}}","Analytic"),"{Product.{ExerciseType=x}}","European"), "{ModelParameters.{SkewStickinessRatio=x}}", 1)
+        volswap = pymfl.MflData().SetProperty(pymfl.MflData().SetProperty(volswap, "{ModelParameters.{SkewStickinessRatio=x}}", 1), "{ModelParameters.{ConvexityStickinessRatio=x}}", 1)
+        
+        spot = volswap.AssetData.Price
+        fwd = pymfl.Dividend().ForwardPrice(volswap.AssetData.Dividend, pymfl.Equities().ContextGetCcyForecastsBase(volswap)[0][0], expiry_date, valuation_date, spot)
+        
+        strikes = get_bbg_strikes(thisu, spot, expiry_date, valuation_date)
+        base_weights, k_power = calculate_trapezoidal_weights(strikes, swap_type)
+        option_types = ["Put" if K < fwd else "Call" for K in strikes]
+        
+        slides = [spot * (1.0 + 0.01 * x) for x in range(-20, 21)]
+        nslides = len(slides)
+        nstrikes = len(strikes)
+        
+        gammaX = np.zeros((nslides, nstrikes))
+        gammaY = np.zeros(nslides)
+        thetaX = np.zeros((nslides, nstrikes))
+        thetaY = np.zeros(nslides)
+        
+        print(f"DEBUG: Spot extracted dynamically as {spot:.2f} for {valuation_date.strftime('%Y-%m-%d')}")
+        print(f"DEBUG: Evaluated {nstrikes} liquid strikes across {nslides} spot slides.")
+        
+        st = time.time()
+        print("Valuing swap across spot slides via pyMFL cluster...")
+        outputs = pymfl.MflArray.Map(pymfl.MflArray([pymfl.MflData().SetProperty(pymfl.MflData().SetProperty(volswap, spotRule, x), fixingRule, x) for x in slides]), "=Equities.Valuation(,x)", pymfl.BasicTools().RunCluster("MDN"))
+        
+        print("Valuing options strip across spot slides via pyMFL cluster...")
+        vanillaoutputs = pymfl.MflArray.Map(pymfl.MflArray([pymfl.MflData().SetProperty(pymfl.MflData().SetProperty(pymfl.MflData().SetProperty(vanilla, payoffRule, "Put" if k < fwd else "Call"), percentStrikeRule, k / spot), spotRule, sd) for sd in slides for k in strikes]), "=Equities.Valuation(,x)", pymfl.BasicTools().RunCluster("MDN"))
+        print(f"DEBUG: Cluster execution time: {time.time() - st:.2f} seconds")
+        
+        t = (len(volswap.Product.Schedule) - 1) / 252.0
+        v = volswap.Product.VarianceUnits
+        volScalar = 100.0 if swap_type == "Volatility" else 10000.0
+        theoretical_positions = base_weights * (volScalar * v / t)
+        
+        for i in range(nslides):
+            swapVal = outputs[i]
+            gammaY[i] = swapVal.Gamma[0].Value(0,0) * slides[i] * slides[i] / 100.0
+            thetaY[i] = swapVal.Theta   
+
+            for j in range(nstrikes):
+                vanillaVal = vanillaoutputs[i * nstrikes + j]
+                gammaX[i, j] = theoretical_positions[j] * vanillaVal.Gamma[0].Value(0,0) * slides[i] * slides[i] / 100.0
+                thetaX[i, j] = theoretical_positions[j] * vanillaVal.Theta
+                
+        print("DEBUG: Executing Lasso Regression to fit Gamma and Theta...")
+        gam = np.mean(np.abs(gammaY))
+        thet = np.mean(np.abs(thetaY))
+        
+        yvalue = np.concatenate((thetaY/thet, gammaY/gam))
+        xvalue = np.concatenate((thetaX/thet, gammaX/gam), axis=0)
+        
+        clf = linear_model.Lasso(alpha=0.00001, positive=True, fit_intercept=False)
+        clf.fit(xvalue, yvalue)
+        extraw = clf.coef_
+        
+        print(f"DEBUG: Lasso regression complete. Mean multiplier: {np.mean(extraw):.4f}")
+        
+        final_trade_quantities = theoretical_positions * extraw
+        
+        df_hedge = pd.DataFrame({
+            "Underlying": thisu,
+            "Strike": strikes,
+            "Option_Type": option_types,
+            "Theoretical_Weight": theoretical_positions,
+            "Lasso_Multiplier": extraw, 
+            "Final_Trade_Quantity": final_trade_quantities
+        })
+        
+        file_suffix = "1overK" if k_power == 1 else "1overK2"
+        csv_path = os.path.join(outputfolder, f"{thisu}_{file_suffix}_hedge.csv")
+        df_hedge.to_csv(csv_path, index=False)
+        print(f"Saved hedge blotter to: {csv_path}")
+        
+        if generate_wex:
+            wex_path = os.path.join(outputfolder, f"{thisu}_{file_suffix}_wex.csv")
+            generate_wex_spreadsheet(df_hedge, expiry_date, wex_path)
+            print(f"Saved WeX spreadsheet to: {wex_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Variance/Volatility Swap Hedger")
+    parser.add_argument("--ticker", nargs="+", required=True)
+    parser.add_argument("--expiry_date", type=str, required=True)
+    parser.add_argument("--valuation_date", type=str, default=datetime.date.today().strftime("%Y-%m-%d"))
+    parser.add_argument("--vega", type=float, default=100000.0)
+    parser.add_argument("--swap_type", type=str, default="Variance")
+    parser.add_argument("--out_folder", type=str, default=r"C:\temp\results")
+    parser.add_argument("-s", action="store_true")
+
+    args = parser.parse_args()
+    v_date = datetime.datetime.strptime(args.valuation_date, "%Y-%m-%d").date()
+    e_date = datetime.datetime.strptime(args.expiry_date, "%Y-%m-%d").date()
+    
+    run_variance_swap_hedge(args.ticker, e_date, args.vega, args.swap_type, args.out_folder, args.s, valuation_date=v_date)
