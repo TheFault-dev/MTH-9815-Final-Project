@@ -456,8 +456,6 @@ test_batch.to_csv(r"C:\temp\results\run_batch.csv", index=False)
 
 
 
-
-
 import os
 import xml.etree.cElementTree as ET
 import datetime
@@ -522,7 +520,6 @@ def generate_contexts(ticker, valuation_date, expiry_date, vega_notional, swap_t
     is_index = ticker == "SPX"
     spot_ticker = ticker.replace('-',' ')
     
-    # DECISION: Bypass CMDB for spot if valuing today to prevent null/stale data
     if valuation_date == datetime.date.today():
         bbg_ticker = f"{ticker} Index" if is_index else f"{ticker} US Equity"
         spot_price = blp.bdp(bbg_ticker, 'PX_LAST').iloc[0, 0]
@@ -609,12 +606,16 @@ def generate_contexts(ticker, valuation_date, expiry_date, vega_notional, swap_t
 
     return context, vs_context
 
-def get_bbg_strikes(ticker: str, spot: float, expiry_date: datetime.date, valuation_date: datetime.date):
+def get_bbg_strikes(ticker: str, expiry_date: datetime.date, valuation_date: datetime.date):
     bbg_ticker = f"{ticker} Index" if ticker == "SPX" else f"{ticker} US Equity"
     
     if valuation_date == datetime.date.today():
+        spot = blp.bdp(bbg_ticker, 'PX_LAST').iloc[0, 0]
         chain = blp.bds(bbg_ticker, 'OPT_CHAIN')
     else:
+        is_index = (ticker == "SPX")
+        spot_ticker = ticker.replace('-', ' ')
+        spot = load_price_from_cmdb(valuation_date, [spot_ticker], 'BLOOMBERG', 'SETTLE', is_index)[0]
         val_date_str = valuation_date.strftime("%Y%m%d")
         chain = blp.bds(bbg_ticker, 'OPT_CHAIN', SINGLE_DATE_OVERRIDE=val_date_str)
         
@@ -631,9 +632,6 @@ def calculate_trapezoidal_weights(strikes: np.ndarray, swap_type: str):
     n = len(strikes)
     weights = np.zeros(n)
     
-    # DECISION: Power logic directly drives file naming convention later
-    k_power = 1 if swap_type == "Volatility" else 0
-    
     for i in range(n):
         K = strikes[i]
         if i == 0:
@@ -643,9 +641,12 @@ def calculate_trapezoidal_weights(strikes: np.ndarray, swap_type: str):
         else:
             dK = (strikes[i+1] - strikes[i-1]) / 2.0
             
-        weights[i] = (dK / (K ** 2)) * (K ** k_power)
-        
-    return weights, k_power
+        if swap_type == "Volatility":
+            weights[i] = dK / K
+        else:
+            weights[i] = dK / (K ** 2)
+            
+    return weights
 
 def run_variance_swap_hedge(underlyings, expiry_date, vega_notional, swap_type, outputfolder, generate_wex, valuation_date=None):
     if valuation_date is None:
@@ -667,8 +668,8 @@ def run_variance_swap_hedge(underlyings, expiry_date, vega_notional, swap_type, 
         spot = volswap.AssetData.Price
         fwd = pymfl.Dividend().ForwardPrice(volswap.AssetData.Dividend, pymfl.Equities().ContextGetCcyForecastsBase(volswap)[0][0], expiry_date, valuation_date, spot)
         
-        strikes = get_bbg_strikes(thisu, spot, expiry_date, valuation_date)
-        base_weights, k_power = calculate_trapezoidal_weights(strikes, swap_type)
+        strikes = get_bbg_strikes(thisu, expiry_date, valuation_date)
+        base_weights = calculate_trapezoidal_weights(strikes, swap_type)
         option_types = ["Put" if K < fwd else "Call" for K in strikes]
         
         slides = [spot * (1.0 + 0.01 * x) for x in range(-20, 21)]
@@ -730,7 +731,7 @@ def run_variance_swap_hedge(underlyings, expiry_date, vega_notional, swap_type, 
             "Final_Trade_Quantity": final_trade_quantities
         })
         
-        file_suffix = "1overK" if k_power == 1 else "1overK2"
+        file_suffix = "1overK" if swap_type == "Volatility" else "1overK2"
         csv_path = os.path.join(outputfolder, f"{thisu}_{file_suffix}_hedge.csv")
         df_hedge.to_csv(csv_path, index=False)
         print(f"Saved hedge blotter to: {csv_path}")
@@ -755,3 +756,4 @@ if __name__ == "__main__":
     e_date = datetime.datetime.strptime(args.expiry_date, "%Y-%m-%d").date()
     
     run_variance_swap_hedge(args.ticker, e_date, args.vega, args.swap_type, args.out_folder, args.s, valuation_date=v_date)
+
