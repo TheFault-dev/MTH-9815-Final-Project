@@ -757,3 +757,256 @@ pivot_partial = pd.pivot_table(
 
 print("\nPartial Smoothing (Alpha=0.5) Binned Matrix:")
 display(pivot_partial)
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import PureWindowsPath
+import pymfl
+from pymfl.translator import translate
+
+class VegaRiskManager:
+    def __init__(self, base_uri=r"\\ibgvsnyeq\usequityderivs"):
+        self.base_uri = base_uri
+        self.valuation_date = None
+        
+    def _to_df(self, rows, dtypes=None):
+        df = pd.DataFrame(rows[1:], columns=rows[0])
+        return df.astype(dtypes) if dtypes else df
+
+    def fetch_data(self, target_date, product_file_pattern="ESPU_Detailed_ProductUnderlier", vega_file_pattern="ESPU_EquityVega_Risk"):
+        """Fetches the raw AVRO files into pandas DataFrames without premature filtering."""
+        self.valuation_date = pd.to_datetime(target_date, format="%Y%m%d")
+        df_product, df_vega = None, None
+        
+        try:
+            base = PureWindowsPath(self.base_uri)
+            product_path = base / "Slides" / target_date / f"{target_date}_{product_file_pattern}.avro"
+            vega_path    = base / "PAA" / "EquityVol.Vega" / target_date / f"{vega_file_pattern}.avro"
+            
+            print(f"Fetching {product_path}...")
+            raw_prod = pymfl.xl().loadTable(fileName=str(product_path))
+            df_product = self._to_df(translate(pymfl.xl().unpack(raw_prod)))
+            
+            print(f"Fetching {vega_path}...")
+            raw_vega = pymfl.xl().loadTable(fileName=str(vega_path))
+            df_vega = self._to_df(translate(pymfl.xl().unpack(raw_vega)))
+            
+        except Exception as e:
+            print(f"Error fetching from AVRO directly: {e}")
+            return None, None
+            
+        return df_product, df_vega
+
+    def process_data(self, df_product, df_vega, target_date, ticker="TSLA.O", books=["SSTK", "WOSR", "ASIA"]):
+        """Uses YOUR EXACT LOGIC to clean, filter, and derive Expiry/Tenor."""
+        valuation_date = pd.to_datetime(target_date, format="%Y%m%d").normalize()
+
+        # --- 1. PRODUCT TABLE PROCESSING ---
+        df_product["ScenarioName"] = pd.to_numeric(df_product["ScenarioName"].astype(str).str.rstrip('%'), errors='coerce') / 100
+
+        df_product_tsla = df_product[
+            (df_product["Type"] == "Vega") &
+            (df_product["Book"].isin(books)) &
+            (df_product["RiskInstrument"].astype(str).str.contains(ticker, na=False))
+        ].copy()
+
+        df_product_tsla["ScenarioValue"] = pd.to_numeric(df_product_tsla["ScenarioValue"], errors="coerce").fillna(0.0)
+
+        scenario_blank = df_product_tsla["ScenarioName"].isna() | (df_product_tsla["ScenarioName"].astype(str).str.strip() == "")
+        vegaexpiry_blank = df_product_tsla["VegaExpiry"].isna() | (df_product_tsla["VegaExpiry"].astype(str).str.strip() == "")
+
+        vegaexpiry_dt = pd.to_datetime(df_product_tsla["VegaExpiry"].astype(str).str.replace(r"\.0$", "", regex=True), errors="coerce")
+
+        instr_last8 = df_product_tsla["Instrument1"].astype(str).str.extract(r"(\d{8})$")[0]
+        instr_last8_dt = pd.to_datetime(instr_last8, format="%Y%m%d", errors="coerce")
+
+        instr_last5 = df_product_tsla["Instrument1"].astype(str).str.extract(r"(\d{5})$")[0]
+        instr_last5_num = pd.to_numeric(instr_last5, errors="coerce")
+
+        expiry = pd.Series(pd.NA, index=df_product_tsla.index, dtype="object")
+        expiry_dt = pd.Series(pd.NaT, index=df_product_tsla.index)
+
+        m1 = ~scenario_blank & ~vegaexpiry_blank
+        expiry.loc[m1] = vegaexpiry_dt.loc[m1]
+        expiry_dt.loc[m1] = vegaexpiry_dt.loc[m1]
+
+        m2 = ~scenario_blank & vegaexpiry_blank & (df_product_tsla["Type"].astype(str) == "Div01")
+        expiry.loc[m2] = instr_last5_num.loc[m2]
+
+        m3 = ~scenario_blank & vegaexpiry_blank & (df_product_tsla["RiskType"].astype(str) == "FwdVol.Vega")
+        expiry.loc[m3] = instr_last8_dt.loc[m3]
+        expiry_dt.loc[m3] = instr_last8_dt.loc[m3]
+
+        df_product_tsla["Expiry"] = expiry
+        df_product_tsla["VolTenor"] = (expiry_dt - valuation_date).dt.days / 365.0
+
+        # --- 2. VEGA RISK TABLE PROCESSING ---
+        df_vega_tsla = df_vega[
+            (df_vega["Book"].isin(books)) &
+            (df_vega["RiskInstrument"].astype(str) == ticker)
+        ].copy()
+
+        df_vega_tsla["Value"] = pd.to_numeric(df_vega_tsla["Value"], errors="coerce").fillna(0.0)
+        df_vega_tsla["VegaMoneyness"] = df_vega_tsla["VegaMoneyness"].astype(float)
+
+        group_keys = [
+            "Instrument1", "TradeGroup", "Transit", "Book", "HedgeableUnit",
+            "SecurityType", "ProductType", "RiskInstrument", "VegaExpiry",
+            "VegaMoneyness", "VegaTenor"
+        ]
+        
+        # Guard against missing columns in raw data before grouping
+        valid_keys = [k for k in group_keys if k in df_vega_tsla.columns]
+        
+        df_vega_tsla_agg = (
+            df_vega_tsla
+            .groupby(valid_keys, dropna=False, as_index=False)["Value"]
+            .sum()
+        )
+
+        return df_product_tsla, df_vega_tsla_agg
+
+    # --- DOWNSTREAM TASKS (Normalization, Binning, Plotting) ---
+
+    def normalize_and_bin_vega(self, df, tenor_col, value_col, bins_years=(1/6, 3/4, 2.0), t_ref=1.0, t_min=1/52, alpha=1.0):
+        """Your partial smoothing logic: normalizes and applies alpha-parameterized binning."""
+        df_norm = df.copy()
+        df_norm[tenor_col] = pd.to_numeric(df_norm[tenor_col], errors='coerce')
+        df_norm = df_norm.dropna(subset=[tenor_col]).copy()
+        
+        floor_t = np.maximum(df_norm[tenor_col], t_min)
+        weights = np.sqrt(t_ref / floor_t)
+        df_norm['NormalizedValue'] = df_norm[value_col] * weights
+        
+        bins = sorted(list(bins_years))
+        allocated_records = []
+        
+        for _, row in df_norm.iterrows():
+            t = row[tenor_col]
+            val = row['NormalizedValue']
+            
+            if t <= bins[0]:
+                row_copy = row.copy()
+                row_copy['BinnedTenor'] = bins[0]
+                row_copy['AllocatedValue'] = val
+                allocated_records.append(row_copy)
+            elif t >= bins[-1]:
+                row_copy = row.copy()
+                row_copy['BinnedTenor'] = bins[-1]
+                row_copy['AllocatedValue'] = val
+                allocated_records.append(row_copy)
+            else:
+                for i in range(len(bins)-1):
+                    if bins[i] <= t < bins[i+1]:
+                        b_lower, b_upper = bins[i], bins[i+1]
+                        L = b_upper - b_lower
+                        M = (b_lower + b_upper) / 2.0
+                        W = alpha * L
+                        
+                        if alpha == 0.0:
+                            w_upper = 0.0 if t < M else 1.0
+                        else:
+                            T_start, T_end = M - W / 2.0, M + W / 2.0
+                            if t <= T_start: w_upper = 0.0
+                            elif t >= T_end: w_upper = 1.0
+                            else: w_upper = (t - T_start) / (T_end - T_start)
+                                
+                        w_lower = 1.0 - w_upper
+                        
+                        if w_lower > 0:
+                            row_lower = row.copy()
+                            row_lower['BinnedTenor'] = b_lower
+                            row_lower['AllocatedValue'] = val * w_lower
+                            allocated_records.append(row_lower)
+                        if w_upper > 0:
+                            row_upper = row.copy()
+                            row_upper['BinnedTenor'] = b_upper
+                            row_upper['AllocatedValue'] = val * w_upper
+                            allocated_records.append(row_upper)
+                        break
+                        
+        return pd.DataFrame(allocated_records)
+
+    def plot_normalization_comparison(self, df_vega_agg, bins_years=(1/6, 3/4, 2.0), alpha=0.5):
+        """Plots Raw Vega (Bars) vs Normalized (Line) vs Smoothed (Line) on exactly your aggregated data."""
+        df = df_vega_agg.copy()
+        df["VegaTenor"] = pd.to_numeric(df["VegaTenor"], errors="coerce")
+        df["Value"] = pd.to_numeric(df["Value"], errors="coerce").fillna(0.0)
+        
+        # 1. Raw & Unbinned Normalized Baseline
+        T_eff = np.maximum(df["VegaTenor"], 1/52)
+        df["Normalized_Value"] = df["Value"] / np.sqrt(T_eff)
+        agg_raw_norm = df.groupby("VegaTenor")[["Value", "Normalized_Value"]].sum()
+        
+        # 2. Alpha-Smoothed Binned Allocation
+        df_binned = self.normalize_and_bin_vega(df, "VegaTenor", "Value", bins_years, alpha=alpha)
+        agg_binned = df_binned.groupby("BinnedTenor")["AllocatedValue"].sum()
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Histogram (Bars) for Raw Vega
+        ax.bar(agg_raw_norm.index, agg_raw_norm["Value"], width=0.02, color='slategray', alpha=0.6, label="Raw Vega (Unnormalized)")
+        
+        # Line Curve for Unbinned Normalized Vega
+        ax.plot(agg_raw_norm.index, agg_raw_norm["Normalized_Value"], marker='x', linestyle=':', color='teal', label="Normalized Vega (Actual Expiries)")
+        
+        # Line Curve for Smoothed Binned Vega
+        ax.plot(agg_binned.index, agg_binned.values, marker='D', markersize=8, color='crimson', linewidth=2.5, label=f"Smoothed Binned Vega (Alpha={alpha})")
+        
+        for b in bins_years:
+            ax.axvline(b, color='black', linestyle='--', alpha=0.3)
+            
+        ax.set_title(f"Vega Risk Allocation: Raw Exposures vs. Normalized & Smoothed (Alpha={alpha})")
+        ax.set_xlabel("Maturity (Years)")
+        ax.set_ylabel("Cumulative Vega Risk")
+        ax.legend()
+        ax.grid(axis='y', alpha=0.3)
+        plt.show()
+
+
+# 1. Initialize and Fetch the Raw Data
+vrm = VegaRiskManager()
+TARGET_DATE = "20260326"
+TICKER = "TSLA.O"
+
+df_product_raw, df_vega_raw = vrm.fetch_data(TARGET_DATE)
+
+# 2. Process using YOUR logic
+df_product_tsla, df_vega_tsla_agg = vrm.process_data(
+    df_product_raw, 
+    df_vega_raw, 
+    TARGET_DATE, 
+    ticker=TICKER, 
+    books=["SSTK", "WOSR", "ASIA"]
+)
+
+# 3. Create the Pivots to verify against your original outputs
+pivot_product_tsla = pd.pivot_table(
+    df_product_tsla,
+    index="ScenarioName",
+    columns=["VolTenor", "Expiry"],
+    values="ScenarioValue",
+    aggfunc="sum",
+    fill_value=0.0
+).sort_index(ascending=True)
+
+pivot_vega_tsla = pd.pivot_table(
+    df_vega_tsla_agg,
+    index="VegaMoneyness",
+    columns="VegaExpiry",
+    values="Value",
+    aggfunc="sum",
+    fill_value=0.0
+)
+
+print("Data processing complete. Pivot tables match original expectations.")
+
+# 4. Run the downstream Visualization Task
+BINS = (2/12, 9/12, 2.0)
+vrm.plot_normalization_comparison(df_vega_tsla_agg, bins_years=BINS, alpha=0.5)
+
