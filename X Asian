@@ -600,3 +600,23 @@ class VegaRiskManager:
         plt.grid(axis='x', alpha=0.3)
         plt.show()
 
+
+
+# 1. Initialize and fetch ENTIRE portfolio (ticker=None)
+vrm = VegaRiskManager()
+TARGET_DATE = "20260326"
+
+df_product_all, df_vega_all = vrm.fetch_data(TARGET_DATE, ticker=None)
+
+# 2. Visualize Top Portfolio Exposures
+vrm.plot_portfolio_summary(df_vega_all, top_n=15)
+
+# 3. Visualize Scenario Shocks for the entire book
+vrm.plot_product_scenario(df_product_all)
+
+# 4. Filter down to TSLA for specific term structure deep-dive
+df_vega_tsla = df_vega_all[df_vega_all["RiskInstrument"].astype(str) == "TSLA.O"]
+
+# 5. Show how smoothing works (Raw vs Normalized vs Smoothed)
+BINS = (2/12, 9/12, 2.0)
+vrm.plot_normalization_comparison(df_vega_tsla, bins_years=BINS)
