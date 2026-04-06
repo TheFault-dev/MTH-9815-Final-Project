@@ -153,3 +153,55 @@ class VegaRiskManager:
         plt.ylabel("Strike Moneyness")
         plt.xlabel("Continuous Term Buckets")
         plt.show()
+
+
+
+import pandas as pd
+from vega_pipeline import VegaRiskManager
+
+# Initialize the manager and map the cloud path
+vrm = VegaRiskManager("file://ibgvsnyeq/usequityderivs/PAA/EquityVol.Vega/")
+
+TARGET_DATE = "20260326"
+TICKER = "TSLA.O"
+
+# Fetch directly from AVRO
+df_product_tsla, df_vega_tsla = vrm.fetch_data(TARGET_DATE, ticker=TICKER)
+
+# Re-create simple unbinned pivots for baseline
+pivot_vega_tsla = pd.pivot_table(df_vega_tsla, index="VegaMoneyness", columns="VegaTenor", values="Value", aggfunc="sum", fill_value=0.0)
+pivot_product_tsla = pd.pivot_table(df_product_tsla, index="ScenarioName", columns="VolTenor", values="ScenarioValue", aggfunc="sum", fill_value=0.0)
+
+print(f"Data Successfully fetched for {TICKER}")
+
+
+
+
+strike_max = vrm.select_hedge_strike(pivot_vega_tsla, logic="max_exposure")
+strike_stress = vrm.select_hedge_strike(pivot_vega_tsla, pivot_product=pivot_product_tsla, logic="scenario_worst")
+
+print(f"Target Hedge Strike (Max Structural Vol Bias): {strike_max}")
+print(f"Target Hedge Strike (Worst Scenario Tail Bias): {strike_stress}")
+
+
+
+# Pass custom boundaries here (e.g. 1/6 = 2 Months, 3/4 = 9 Months)
+df_vega_norm, pivot_binned_tsla = vrm.normalize_and_bin(
+    df_vega_tsla, 
+    boundaries=(1/6, 3/4), 
+    transition_window=2/52 # 2 weeks overlap delta to prevent jumps
+)
+
+display(pivot_binned_tsla.round(2).style.background_gradient(cmap="RdBu", axis=None))
+
+
+
+# Generates line plots proving that without normalization, long-term options 
+# dictate the risk profile. Normalization brings them all to scale.
+vrm.plot_normalization(df_vega_tsla)
+
+
+# Generates the heatmap. You can visually identify exactly which bucket 
+# and which strike contains the most risk and directly apply a trade.
+vrm.plot_binned_heatmap(pivot_binned_tsla, ticker=TICKER)
+
