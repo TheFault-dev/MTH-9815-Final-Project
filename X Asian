@@ -1,0 +1,155 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import warnings
+
+warnings.filterwarnings("ignore")
+
+try:
+    import pymfl_setup
+    import pymfl
+    from pymfl.translator import translate
+except ImportError:
+    pass
+
+class VegaRiskManager:
+    def __init__(self, cloud_base="file://ibgvsnyeq/usequityderivs/PAA/EquityVol.Vega"):
+        # Map the file:// URI to Windows UNC (\\ibgvsnyeq\...) natively
+        self.cloud_base = Path(cloud_base.replace("file://", "//").replace("/", "\\"))
+
+    def fetch_data(self, date_str, ticker="TSLA.O", books=["SSTK", "WOSR", "ASIA"]):
+        """Dynamically pulls Avro files from the cloud server and preprocesses them."""
+        target_dir = self.cloud_base / date_str
+        
+        try:
+            pymfl_setup.start_mfl(pymfl_setup.registered_mfl(), True)
+        except Exception:
+            pass # Already started
+            
+        if not target_dir.exists():
+            print(f"Warning: {target_dir} not found. Attempting local directory fallback...")
+            target_dir = Path(".")
+            
+        prod_dfs, vega_dfs = [], []
+        for avro_path in target_dir.glob("*.avro"):
+            try:
+                raw = pymfl.xl().loadTable(fileName=str(avro_path))
+                df = pd.DataFrame(translate(pymfl.xl().unpack(raw)))
+                df.columns = df.iloc[0]
+                df = df[1:]
+                
+                # Filter early to preserve memory
+                if "ScenarioName" in df.columns:
+                    df = df[(df["Type"] == "Vega") & (df["Book"].isin(books)) & 
+                            (df["RiskInstrument"].astype(str).str.contains(ticker, na=False))]
+                    prod_dfs.append(df)
+                elif "VegaMoneyness" in df.columns:
+                    df = df[(df["Book"].isin(books)) & 
+                            (df["RiskInstrument"].astype(str) == ticker)]
+                    vega_dfs.append(df)
+            except Exception as e:
+                print(f"Failed on {avro_path.name}: {e}")
+                
+        df_product = pd.concat(prod_dfs, ignore_index=True) if prod_dfs else pd.DataFrame()
+        df_vega = pd.concat(vega_dfs, ignore_index=True) if vega_dfs else pd.DataFrame()
+        
+        # Cleanup column types
+        if not df_vega.empty:
+            df_vega["Value"] = pd.to_numeric(df_vega["Value"], errors="coerce").fillna(0.0)
+            df_vega["VegaMoneyness"] = pd.to_numeric(df_vega["VegaMoneyness"], errors="coerce")
+            df_vega["VegaTenor"] = pd.to_numeric(df_vega["VegaTenor"], errors="coerce")
+            
+        if not df_product.empty:
+            df_product["ScenarioName"] = pd.to_numeric(df_product["ScenarioName"].astype(str).str.rstrip('%'), errors='coerce') / 100
+            df_product["ScenarioValue"] = pd.to_numeric(df_product["ScenarioValue"], errors="coerce").fillna(0.0)
+            df_product["VolTenor"] = pd.to_numeric(df_product["VolTenor"], errors="coerce").fillna(0.0)
+
+        return df_product, df_vega
+
+    def select_hedge_strike(self, pivot_vega, pivot_product=None, logic="max_exposure"):
+        """Identifies optimal strike. Compatible with both raw and binned vega grids."""
+        if logic == "max_exposure":
+            # Target the strike with the largest absolute total vega across all buckets/expiries
+            return pivot_vega.sum(axis=1).abs().idxmax()
+            
+        elif logic == "scenario_worst" and pivot_product is not None:
+            # Find the scenario shock causing the most PnL pain (e.g. -0.20)
+            worst_scenario = pivot_product.sum(axis=1).idxmin()
+            
+            # If the market drops 20%, the new ATM strike is the current 0.80 Moneyness.
+            target_moneyness = 1.0 + worst_scenario
+            
+            # Snap to the closest available strike in the Vega grid
+            available_strikes = pivot_vega.index
+            return min(available_strikes, key=lambda x: abs(x - target_moneyness))
+        else:
+            raise ValueError("Invalid logic or missing product matrix.")
+
+    def normalize_and_bin(self, df_vega, boundaries=(1/6, 3/4), transition_window=2/52):
+        """
+        1. Normalizes Vega to 1-Year Eqv.
+        2. Bins into buckets continuously to prevent boundary jumps.
+        """
+        df = df_vega.copy()
+        T = df["VegaTenor"].values
+        
+        # 1. Math Normalization (1-week floor)
+        T_eff = np.maximum(T, 1/52)
+        df["Norm_Factor"] = 1.0 / np.sqrt(T_eff)
+        df["Normalized_Value"] = df["Value"] * df["Norm_Factor"]
+        
+        # 2. Continuous Binning Weights
+        delta = transition_window
+        transitions = []
+        for b in boundaries:
+            w = np.clip((b + delta/2 - T) / delta, 0, 1)
+            transitions.append(w)
+            
+        weights = [transitions[0]] # Short bucket
+        for i in range(1, len(boundaries)):
+            weights.append((1 - transitions[i-1]) * transitions[i]) # Mid buckets
+        weights.append(1 - transitions[-1]) # Long bucket
+        
+        # Create columns
+        bucket_names = [f"Short (<{boundaries[0]:.2f}Y)"]
+        for i in range(len(boundaries)-1):
+            bucket_names.append(f"Mid ({boundaries[i]:.2f}Y - {boundaries[i+1]:.2f}Y)")
+        bucket_names.append(f"Long (>{boundaries[-1]:.2f}Y)")
+        
+        for i, name in enumerate(bucket_names):
+            df[name] = df["Normalized_Value"] * weights[i]
+            
+        # Group to create the binned Pivot Grid
+        pivot_binned = df.groupby("VegaMoneyness")[bucket_names].sum()
+        return df, pivot_binned
+
+    def plot_normalization(self, df_vega):
+        """Plots Unbinned Total Vega vs Normalized Total Vega by Term Structure"""
+        df = df_vega.copy()
+        T_eff = np.maximum(df["VegaTenor"], 1/52)
+        df["Normalized_Value"] = df["Value"] / np.sqrt(T_eff)
+        
+        agg = df.groupby("VegaTenor")[["Value", "Normalized_Value"]].sum()
+        
+        plt.figure(figsize=(12, 5))
+        plt.plot(agg.index, agg["Value"], marker='o', color='crimson', label="Raw Vega")
+        plt.plot(agg.index, agg["Normalized_Value"], marker='s', color='teal', label="Normalized Vega (1Y Eqv)")
+        plt.axvline(1/52, color='black', linestyle='--', label='1-Week Cap Limit')
+        
+        plt.title("Impact of $\sqrt{T}$ Normalization Across Term Structure")
+        plt.xlabel("Maturity (Years)")
+        plt.ylabel("Cumulative Vega Risk")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.show()
+
+    def plot_binned_heatmap(self, pivot_binned, ticker="TSLA.O"):
+        """Generates a heatmap for the exact binned exposure required by the desk."""
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(pivot_binned, cmap="RdBu", center=0, annot=True, fmt=".0f", linewidths=.5)
+        plt.title(f"{ticker} Normalized & Binned Vega Exposure")
+        plt.ylabel("Strike Moneyness")
+        plt.xlabel("Continuous Term Buckets")
+        plt.show()
