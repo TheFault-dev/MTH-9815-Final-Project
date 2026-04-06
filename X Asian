@@ -1006,6 +1006,51 @@ class VegaRiskManager:
         plt.grid(axis='x', alpha=0.3)
         plt.show()
 
+    def plot_unbinned_normalized_barplot(self, df_vega_agg):
+        """Bar plot of Unbinned Normalized Total Vega by Tenor."""
+        df = df_vega_agg.copy()
+        df["VegaTenor"] = pd.to_numeric(df["VegaTenor"], errors="coerce")
+        df["Value"] = pd.to_numeric(df["Value"], errors="coerce").fillna(0.0)
+        
+        # Apply normalization
+        T_eff = np.maximum(df["VegaTenor"], 1/52)
+        df["NormalizedValue"] = df["Value"] / np.sqrt(T_eff)
+        
+        # Aggregate by Tenor
+        df_unbinned_agg = df.groupby("VegaTenor")["NormalizedValue"].sum().reset_index()
+        
+        plt.figure(figsize=(10, 5))
+        sns.barplot(data=df_unbinned_agg, x="VegaTenor", y="NormalizedValue", color="royalblue")
+        plt.title("Unbinned Normalized Total Vega by Tenor")
+        plt.xlabel("Time to Expiry (Years)")
+        plt.ylabel("Normalized Vega Exposure")
+        plt.xticks(rotation=45)
+        plt.grid(axis='y', alpha=0.3)
+        plt.show()
+
+    def plot_binned_heatmap(self, df_vega_agg, bins_years=(1/6, 3/4, 2.0), alpha=0.5, ticker="TSLA.O"):
+        """Generates a heatmap for the binned exposure required by the desk."""
+        # Run the binning logic
+        df_binned = self.normalize_and_bin_vega(df_vega_agg, "VegaTenor", "Value", bins_years, alpha=alpha)
+        
+        # Pivot by Moneyness and Binned Tenor
+        pivot_binned = pd.pivot_table(
+            df_binned,
+            index="VegaMoneyness",
+            columns="BinnedTenor",
+            values="AllocatedValue",
+            aggfunc="sum",
+            fill_value=0.0
+        )
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(pivot_binned, cmap="RdBu", center=0, annot=True, fmt=".0f", linewidths=.5)
+        plt.title(f"{ticker} - Binned Normalized Vega Exposure by Moneyness (Alpha={alpha})")
+        plt.ylabel("Strike Moneyness")
+        plt.xlabel("Continuous Term Buckets (Years)")
+        plt.show()
+
+
 
 
 # 1. Initialize and Fetch the Raw Data
@@ -1048,4 +1093,12 @@ print("Data processing complete. Pivot tables match original expectations.")
 # 4. Run the downstream Visualization Task
 BINS = (2/12, 9/12, 2.0)
 vrm.plot_normalization_comparison(df_vega_tsla_agg, bins_years=BINS, alpha=0.5)
+
+
+# 1. Generate the bar plot for Unbinned Normalized Vega
+vrm.plot_unbinned_normalized_barplot(df_vega_tsla_agg)
+
+# 2. Generate the heatmap for the Binned Normalized Vega Exposure
+vrm.plot_binned_heatmap(df_vega_tsla_agg, bins_years=BINS, alpha=0.5, ticker=TICKER)
+
 
