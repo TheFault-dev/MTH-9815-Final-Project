@@ -695,38 +695,44 @@ vrm.plot_normalization_comparison(df_vega_tsla, bins_years=BINS)
                         
         return pd.DataFrame(allocated_records)
 
-    def plot_normalization_comparison(self, df_vega, bins_years=(1/6, 3/4, 2.0), alphas=[0.0, 0.5, 1.0]):
-        """Visualizes how different alpha values impact the final risk allocation at the nodes."""
+    def plot_normalization_comparison(self, df_vega, bins_years=(1/6, 3/4, 2.0), alpha=0.5):
+        """Visualizes Raw Vega (Histogram) vs Normalized vs Smoothed Vega (Lines)."""
         df = df_vega.copy()
         df["VegaTenor"] = pd.to_numeric(df["VegaTenor"], errors="coerce")
         df["Value"] = pd.to_numeric(df["Value"], errors="coerce").fillna(0.0)
         
-        # Unbinned Normalized Baseline
+        # 1. Raw & Unbinned Normalized Baseline
         T_eff = np.maximum(df["VegaTenor"], 1/52)
         df["Normalized_Value"] = df["Value"] / np.sqrt(T_eff)
-        agg_raw_norm = df.groupby("VegaTenor")["Normalized_Value"].sum()
+        agg_raw_norm = df.groupby("VegaTenor")[["Value", "Normalized_Value"]].sum()
         
-        plt.figure(figsize=(12, 6))
-        plt.plot(agg_raw_norm.index, agg_raw_norm.values, marker='x', color='gray', alpha=0.5, label="Unbinned Normalized (Actual Expiries)")
+        # 2. Alpha-Smoothed Binned Allocation
+        df_binned = self.normalize_and_bin_vega(df, "VegaTenor", "Value", bins_years, alpha=alpha)
+        agg_binned = df_binned.groupby("BinnedTenor")["AllocatedValue"].sum()
         
-        # Test different alphas
-        colors = ['crimson', 'teal', 'darkorange']
-        labels = ['Hard Cutoff (Alpha=0)', 'Partial Smoothing (Alpha=0.5)', 'Full Smoothing (Alpha=1.0)']
+        fig, ax = plt.subplots(figsize=(12, 6))
         
-        for idx, a in enumerate(alphas):
-            df_binned = self.normalize_and_bin_vega(df, "VegaTenor", "Value", bins_years, alpha=a)
-            agg_binned = df_binned.groupby("BinnedTenor")["AllocatedValue"].sum()
-            plt.plot(agg_binned.index, agg_binned.values, marker='D', markersize=8, linewidth=2, color=colors[idx], label=labels[idx])
-            
+        # Histogram (Bars) for Raw / Unnormalized Vega
+        # Using a small width to simulate a histogram bin for exact option expiries
+        ax.bar(agg_raw_norm.index, agg_raw_norm["Value"], width=0.02, color='slategray', alpha=0.6, label="Raw Vega (Unnormalized)")
+        
+        # Line Curve for Unbinned Normalized Vega
+        ax.plot(agg_raw_norm.index, agg_raw_norm["Normalized_Value"], marker='x', linestyle=':', color='teal', label="Normalized Vega (Actual Expiries)")
+        
+        # Line Curve for Smoothed Binned Vega
+        ax.plot(agg_binned.index, agg_binned.values, marker='D', markersize=8, color='crimson', linewidth=2.5, label=f"Smoothed Binned Vega (Alpha={alpha})")
+        
+        # Mark the bin nodes vertically
         for b in bins_years:
-            plt.axvline(b, color='black', linestyle='--', alpha=0.2)
+            ax.axvline(b, color='black', linestyle='--', alpha=0.3)
             
-        plt.title("Impact of Alpha Parameter on Binned Vega Allocation")
-        plt.xlabel("Maturity Nodes (Years)")
-        plt.ylabel("Cumulative Allocated Vega")
-        plt.legend()
-        plt.grid(alpha=0.3)
+        ax.set_title(f"Vega Risk Allocation: Raw Exposures vs. Normalized & Smoothed (Alpha={alpha})")
+        ax.set_xlabel("Maturity (Years)")
+        ax.set_ylabel("Cumulative Vega Risk")
+        ax.legend()
+        ax.grid(axis='y', alpha=0.3)
         plt.show()
+
 
 
 # Assuming you have already initialized vrm and fetched df_vega_all
