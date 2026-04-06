@@ -620,3 +620,204 @@ df_vega_tsla = df_vega_all[df_vega_all["RiskInstrument"].astype(str) == "TSLA.O"
 # 5. Show how smoothing works (Raw vs Normalized vs Smoothed)
 BINS = (2/12, 9/12, 2.0)
 vrm.plot_normalization_comparison(df_vega_tsla, bins_years=BINS)
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import PureWindowsPath
+import pymfl
+from pymfl.translator import translate
+
+class VegaRiskManager:
+    def __init__(self, base_uri=r"\\ibgvsnyeq\usequityderivs"):
+        self.base_uri = base_uri
+        self.valuation_date = None
+        
+    def _to_df(self, rows, dtypes=None):
+        df = pd.DataFrame(rows[1:], columns=rows[0])
+        return df.astype(dtypes) if dtypes else df
+
+    def fetch_data(self, target_date, ticker=None, product_file_pattern="ESPU_Detailed_ProductUnderlier", vega_file_pattern="ESPU_EquityVega_Risk"):
+        self.valuation_date = pd.to_datetime(target_date, format="%Y%m%d")
+        df_product, df_vega = None, None
+        
+        try:
+            base = PureWindowsPath(self.base_uri)
+            product_path = base / "Slides" / target_date / f"{target_date}_{product_file_pattern}.avro"
+            vega_path    = base / "PAA" / "EquityVol.Vega" / target_date / f"{vega_file_pattern}.avro"
+            
+            print(f"Fetching {product_path}...")
+            raw_prod = pymfl.xl().loadTable(fileName=str(product_path))
+            df_product = self._to_df(translate(pymfl.xl().unpack(raw_prod)))
+            
+            print(f"Fetching {vega_path}...")
+            raw_vega = pymfl.xl().loadTable(fileName=str(vega_path))
+            df_vega = self._to_df(translate(pymfl.xl().unpack(raw_vega)))
+            
+        except Exception as e:
+            print(f"Error fetching from AVRO directly: {e}")
+            return None, None
+
+        # If ticker is None, keep the entire portfolio
+        if ticker:
+            df_product = df_product[df_product["RiskInstrument"].astype(str).str.contains(ticker, na=False)].copy()
+            df_vega = df_vega[df_vega["RiskInstrument"].astype(str) == ticker].copy()
+            
+        return df_product, df_vega
+
+    def normalize_and_bin_vega(self, df, tenor_col, value_col, bins_years=(1/6, 3/4, 2.0), t_ref=1.0, t_min=1/52):
+        df_norm = df.copy()
+        df_norm[tenor_col] = pd.to_numeric(df_norm[tenor_col], errors='coerce')
+        df_norm = df_norm.dropna(subset=[tenor_col]).copy()
+        
+        floor_t = np.maximum(df_norm[tenor_col], t_min)
+        weights = np.sqrt(t_ref / floor_t)
+        df_norm['NormalizedValue'] = df_norm[value_col] * weights
+        
+        bins = sorted(list(bins_years))
+        allocated_records = []
+        
+        for _, row in df_norm.iterrows():
+            t = row[tenor_col]
+            val = row['NormalizedValue']
+            
+            if t <= bins[0]:
+                row['BinnedTenor'] = bins[0]
+                row['AllocatedValue'] = val
+                allocated_records.append(row)
+            elif t >= bins[-1]:
+                row['BinnedTenor'] = bins[-1]
+                row['AllocatedValue'] = val
+                allocated_records.append(row)
+            else:
+                for i in range(len(bins)-1):
+                    if bins[i] <= t < bins[i+1]:
+                        b_lower, b_upper = bins[i], bins[i+1]
+                        
+                        w_lower = (b_upper - t) / (b_upper - b_lower)
+                        w_upper = (t - b_lower) / (b_upper - b_lower)
+                        
+                        row_lower = row.copy()
+                        row_lower['BinnedTenor'] = b_lower
+                        row_lower['AllocatedValue'] = val * w_lower
+                        allocated_records.append(row_lower)
+                        
+                        row_upper = row.copy()
+                        row_upper['BinnedTenor'] = b_upper
+                        row_upper['AllocatedValue'] = val * w_upper
+                        allocated_records.append(row_upper)
+                        break
+                        
+        return pd.DataFrame(allocated_records)
+
+    def select_hedging_strikes(self, df_vega, strategy="max_absolute"):
+        df_vega["Value"] = pd.to_numeric(df_vega["Value"], errors="coerce").fillna(0.0)
+        if strategy == "max_absolute":
+            return df_vega.groupby("VegaMoneyness")["Value"].sum().abs().idxmax()
+        elif strategy == "max_per_expiry":
+            best_strikes = {}
+            for exp in df_vega["VegaExpiry"].unique():
+                sub_df = df_vega[df_vega["VegaExpiry"] == exp]
+                idx = sub_df["Value"].abs().idxmax()
+                best_strikes[exp] = sub_df.loc[idx, "VegaMoneyness"]
+            return best_strikes
+        else:
+            raise ValueError("Unknown strategy")
+
+    # --- NEW & UPDATED VISUALIZATION METHODS ---
+
+    def plot_normalization_comparison(self, df_vega, bins_years=(1/6, 3/4, 2.0)):
+        """Plots Raw vs Normalized vs Smoothed (Binned) Vega on the same chart."""
+        df = df_vega.copy()
+        df["VegaTenor"] = pd.to_numeric(df["VegaTenor"], errors="coerce")
+        df["Value"] = pd.to_numeric(df["Value"], errors="coerce").fillna(0.0)
+        
+        # 1. Raw & Unbinned Normalized
+        T_eff = np.maximum(df["VegaTenor"], 1/52)
+        df["Normalized_Value"] = df["Value"] / np.sqrt(T_eff)
+        agg_raw_norm = df.groupby("VegaTenor")[["Value", "Normalized_Value"]].sum()
+        
+        # 2. Smoothed Binned
+        df_binned = self.normalize_and_bin_vega(df, "VegaTenor", "Value", bins_years)
+        agg_binned = df_binned.groupby("BinnedTenor")["AllocatedValue"].sum()
+        
+        plt.figure(figsize=(12, 6))
+        # Original Tenor plots
+        plt.plot(agg_raw_norm.index, agg_raw_norm["Value"], marker='o', color='gray', linestyle=':', label="Raw Vega (Actual Expiries)")
+        plt.plot(agg_raw_norm.index, agg_raw_norm["Normalized_Value"], marker='x', color='teal', alpha=0.5, label="Normalized (Actual Expiries)")
+        
+        # Binned Node plot
+        plt.plot(agg_binned.index, agg_binned.values, marker='D', markersize=8, color='crimson', linewidth=2, label="Smoothed & Binned Vega (Nodes)")
+        
+        # Mark the bin nodes vertically
+        for b in bins_years:
+            plt.axvline(b, color='black', linestyle='--', alpha=0.3)
+            
+        plt.title("Understanding Smoothing: Raw vs Normalized vs Binned Allocation")
+        plt.xlabel("Maturity (Years)")
+        plt.ylabel("Cumulative Vega Risk")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.show()
+
+    def plot_product_scenario(self, df_product, ticker=None):
+        """Visualizes Vega shock scenarios from the Product table."""
+        df = df_product.copy()
+        df["ScenarioName"] = pd.to_numeric(df["ScenarioName"].astype(str).str.rstrip('%'), errors='coerce') / 100
+        df["ScenarioValue"] = pd.to_numeric(df["ScenarioValue"], errors="coerce").fillna(0.0)
+        
+        agg_scenario = df.groupby("ScenarioName")["ScenarioValue"].sum().sort_index()
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(agg_scenario.index, agg_scenario.values, marker='o', color='darkorange', linewidth=2)
+        plt.axhline(0, color='black', linewidth=1)
+        plt.axvline(0, color='black', linewidth=1, linestyle='--')
+        title_str = f"Total Portfolio Vega by Market Scenario" if not ticker else f"{ticker} Vega by Market Scenario"
+        plt.title(title_str)
+        plt.xlabel("Market Shock Scenario (e.g., -0.5 = -50% drop)")
+        plt.ylabel("Aggregated Vega Exposure")
+        plt.grid(alpha=0.3)
+        plt.show()
+
+    def plot_portfolio_summary(self, df_vega, top_n=10):
+        """Visualizes the top absolute exposures across the entire portfolio."""
+        df = df_vega.copy()
+        df["Value"] = pd.to_numeric(df["Value"], errors="coerce").fillna(0.0)
+        
+        # Calculate absolute sum per instrument to find biggest movers
+        agg_port = df.groupby("RiskInstrument")["Value"].sum().abs().sort_values(ascending=False).head(top_n)
+        
+        plt.figure(figsize=(12, 6))
+        sns.barplot(x=agg_port.values, y=agg_port.index, palette="viridis")
+        plt.title(f"Top {top_n} Portfolio Vega Exposures (Absolute Magnitude)")
+        plt.xlabel("Total Absolute Vega")
+        plt.ylabel("Risk Instrument")
+        plt.grid(axis='x', alpha=0.3)
+        plt.show()
+
+
+
+# Assuming you have already initialized vrm and fetched df_vega_all
+df_vega_tsla = df_vega_all[df_vega_all["RiskInstrument"].astype(str) == "TSLA.O"]
+
+BINS = (2/12, 9/12, 2.0)
+
+# Visualize the effect of alpha = 0.0, 0.5, and 1.0 simultaneously
+vrm.plot_normalization_comparison(df_vega_tsla, bins_years=BINS, alphas=[0.0, 0.5, 1.0])
+
+# To see the actual tabular output of partial smoothing:
+df_binned_partial = vrm.normalize_and_bin_vega(df_vega_tsla, "VegaTenor", "Value", bins_years=BINS, alpha=0.5)
+
+pivot_partial = pd.pivot_table(
+    df_binned_partial,
+    index="VegaMoneyness",
+    columns="BinnedTenor",
+    values="AllocatedValue",
+    aggfunc="sum",
+    fill_value=0.0
+)
+
+print("\nPartial Smoothing (Alpha=0.5) Binned Matrix:")
+display(pivot_partial)
