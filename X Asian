@@ -968,6 +968,45 @@ class VegaRiskManager:
         ax.grid(axis='y', alpha=0.3)
         plt.show()
 
+    def plot_product_scenario(self, df_product, ticker="TSLA.O"):
+        """Visualizes Vega shock scenarios from the Product table."""
+        df = df_product.copy()
+        
+        # Group by the cleaned ScenarioName
+        agg_scenario = df.groupby("ScenarioName")["ScenarioValue"].sum().sort_index()
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(agg_scenario.index, agg_scenario.values, marker='o', color='darkorange', linewidth=2)
+        plt.axhline(0, color='black', linewidth=1)
+        plt.axvline(0, color='black', linewidth=1, linestyle='--')
+        
+        title_str = f"{ticker} Vega by Market Scenario" if ticker else "Total Portfolio Vega by Market Scenario"
+        plt.title(title_str)
+        plt.xlabel("Market Shock Scenario (e.g., -0.50 = -50% drop)")
+        plt.ylabel("Aggregated Vega Exposure")
+        plt.grid(alpha=0.3)
+        plt.show()
+
+    def plot_portfolio_summary(self, df_vega_agg, top_n=10):
+        """Visualizes the top absolute exposures across the portfolio."""
+        df = df_vega_agg.copy()
+        
+        # Calculate absolute sum per instrument to find biggest movers
+        agg_port = df.groupby("RiskInstrument")["Value"].sum().abs().sort_values(ascending=False).head(top_n)
+        
+        if agg_port.empty:
+            print("No data available to plot portfolio summary.")
+            return
+
+        plt.figure(figsize=(12, 6))
+        sns.barplot(x=agg_port.values, y=agg_port.index, palette="viridis")
+        plt.title(f"Top {top_n} Portfolio Vega Exposures (Absolute Magnitude)")
+        plt.xlabel("Total Absolute Vega")
+        plt.ylabel("Risk Instrument")
+        plt.grid(axis='x', alpha=0.3)
+        plt.show()
+
+
 
 # 1. Initialize and Fetch the Raw Data
 vrm = VegaRiskManager()
