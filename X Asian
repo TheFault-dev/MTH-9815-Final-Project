@@ -205,3 +205,221 @@ vrm.plot_normalization(df_vega_tsla)
 # and which strike contains the most risk and directly apply a trade.
 vrm.plot_binned_heatmap(pivot_binned_tsla, ticker=TICKER)
 
+
+
+
+
+# vega_pipeline.py
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import pymfl
+from pymfl.translator import translate
+
+class VegaRiskManager:
+    def __init__(self, base_uri="file://ibgvsnyeq/usequityderivs/PAA/EquityVol.Vega/"):
+        self.base_uri = base_uri
+        self.valuation_date = None
+        
+    def _to_df(self, rows, dtypes=None):
+        df = pd.DataFrame(rows[1:], columns=rows[0])
+        return df.astype(dtypes) if dtypes else df
+
+    def fetch_data(self, target_date, ticker, product_file_pattern="ESPU_Detailed_ProductUnderlier", vega_file_pattern="ESPU_EquityVega_Risk"):
+        """
+        Optimized fetch: Only loads the specific AVRO files containing the needed patterns.
+        """
+        self.valuation_date = pd.to_datetime(target_date, format="%Y%m%d")
+        uri_path = f"{self.base_uri}{target_date}/"
+        
+        df_product, df_vega = None, None
+        
+        # In a real environment, you might use a cloud path globber. 
+        # Here we simulate finding the specific files to avoid loading everything.
+        try:
+            # Construct expected file names based on standard conventions
+            product_uri = f"{uri_path}{target_date}_{product_file_pattern}.avro"
+            vega_uri = f"{uri_path}{target_date}_{vega_file_pattern}.avro"
+            
+            # Fetch Product Underlier
+            print(f"Fetching {product_uri}...")
+            raw_prod = pymfl.xl().loadTable(fileName=product_uri)
+            df_product = self._to_df(translate(pymfl.xl().unpack(raw_prod)))
+            
+            # Fetch Vega Risk
+            print(f"Fetching {vega_uri}...")
+            raw_vega = pymfl.xl().loadTable(fileName=vega_uri)
+            df_vega = self._to_df(translate(pymfl.xl().unpack(raw_vega)))
+            
+        except Exception as e:
+            print(f"Error fetching from AVRO directly: {e}. Ensure file path and pymfl setup are correct.")
+            return None, None
+
+        # Filter specifically for the ticker to save memory
+        df_product = df_product[df_product["RiskInstrument"].astype(str).str.contains(ticker, na=False)].copy()
+        df_vega = df_vega[df_vega["RiskInstrument"].astype(str) == ticker].copy()
+        
+        return df_product, df_vega
+
+    def normalize_and_bin_vega(self, df, tenor_col, value_col, bins_years=(1/6, 3/4, 2.0), t_ref=1.0, t_min=1/52):
+        """
+        Normalizes vega using the 1/sqrt(T) rule and allocates risk continuously to predefined bins.
+        """
+        df_norm = df.copy()
+        df_norm[tenor_col] = pd.to_numeric(df_norm[tenor_col], errors='coerce')
+        df_norm = df_norm.dropna(subset=[tenor_col]).copy()
+        
+        # 1. Normalize Vega
+        # W(T) = sqrt( T_ref / max(T, T_min) )
+        floor_t = np.maximum(df_norm[tenor_col], t_min)
+        weights = np.sqrt(t_ref / floor_t)
+        df_norm['NormalizedValue'] = df_norm[value_col] * weights
+        
+        # 2. Continuous Binning (Risk Allocation)
+        bins = sorted(list(bins_years))
+        allocated_records = []
+        
+        for _, row in df_norm.iterrows():
+            t = row[tenor_col]
+            val = row['NormalizedValue']
+            
+            if t <= bins[0]:
+                row_copy = row.copy()
+                row_copy['BinnedTenor'] = bins[0]
+                row_copy['AllocatedValue'] = val
+                allocated_records.append(row_copy)
+            elif t >= bins[-1]:
+                row_copy = row.copy()
+                row_copy['BinnedTenor'] = bins[-1]
+                row_copy['AllocatedValue'] = val
+                allocated_records.append(row_copy)
+            else:
+                # Find flanking bins
+                for i in range(len(bins)-1):
+                    if bins[i] <= t < bins[i+1]:
+                        b_lower, b_upper = bins[i], bins[i+1]
+                        
+                        w_lower = (b_upper - t) / (b_upper - b_lower)
+                        w_upper = (t - b_lower) / (b_upper - b_lower)
+                        
+                        row_lower = row.copy()
+                        row_lower['BinnedTenor'] = b_lower
+                        row_lower['AllocatedValue'] = val * w_lower
+                        allocated_records.append(row_lower)
+                        
+                        row_upper = row.copy()
+                        row_upper['BinnedTenor'] = b_upper
+                        row_upper['AllocatedValue'] = val * w_upper
+                        allocated_records.append(row_upper)
+                        break
+                        
+        return pd.DataFrame(allocated_records)
+
+    def select_hedging_strikes(self, df_vega, strategy="max_absolute"):
+        """
+        Selects the optimal strike (Moneyness) to hedge based on different logics.
+        """
+        if strategy == "max_absolute":
+            # Select the moneyness that has the highest absolute total vega across all maturities
+            strike_exposure = df_vega.groupby("VegaMoneyness")["Value"].sum().abs()
+            best_strike = strike_exposure.idxmax()
+            return best_strike
+        
+        elif strategy == "max_per_expiry":
+            # Returns a dictionary of the highest exposure moneyness per expiry
+            best_strikes = {}
+            expiries = df_vega["VegaExpiry"].unique()
+            for exp in expiries:
+                sub_df = df_vega[df_vega["VegaExpiry"] == exp]
+                idx = sub_df["Value"].abs().idxmax()
+                best_strikes[exp] = sub_df.loc[idx, "VegaMoneyness"]
+            return best_strikes
+        else:
+            raise ValueError("Unknown strategy")
+
+
+# Jupyter Notebook Cell 1: Setup and Fetch
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from vega_pipeline import VegaRiskManager
+
+# Initialize
+vrm = VegaRiskManager("file://ibgvsnyeq/usequityderivs/PAA/EquityVol.Vega/")
+TARGET_DATE = "20260326"
+TICKER = "TSLA.O"
+
+# If you are testing locally and still want to use your CSVs for speed during development:
+# df_product_tsla = pd.read_csv("20260326_ESPU_Detailed_ProductUnderlier.csv", index_col=0)
+# df_vega_tsla = pd.read_csv("ESPU_EquityVega_Risk.csv", index_col=0)
+# df_product_tsla = df_product_tsla[df_product_tsla["RiskInstrument"].astype(str).str.contains(TICKER, na=False)]
+# df_vega_tsla = df_vega_tsla[df_vega_tsla["RiskInstrument"].astype(str) == TICKER]
+
+# To use the optimized cloud fetch:
+df_product_tsla, df_vega_tsla = vrm.fetch_data(TARGET_DATE, TICKER)
+print("Data ready.")
+
+
+# Jupyter Notebook Cell 2: Strike Selection
+# Ensure numeric types
+df_vega_tsla["Value"] = pd.to_numeric(df_vega_tsla["Value"], errors="coerce").fillna(0.0)
+df_vega_tsla["VegaMoneyness"] = df_vega_tsla["VegaMoneyness"].astype(float)
+df_vega_tsla["VegaTenor"] = pd.to_numeric(df_vega_tsla["VegaTenor"], errors="coerce")
+
+# Test Strike Selection
+overall_best_strike = vrm.select_hedging_strikes(df_vega_tsla, strategy="max_absolute")
+best_strikes_per_exp = vrm.select_hedging_strikes(df_vega_tsla, strategy="max_per_expiry")
+
+print(f"Overall ideal strike (moneyness) to hedge: {overall_best_strike}")
+print(f"Ideal strikes per expiry:\n{best_strikes_per_exp}")
+
+
+# Jupyter Notebook Cell 3: Normalization & Binning
+BINS = (2/12, 9/12, 2.0) # Short (2m), Mid (9m), Long (2y)
+
+# Process Moneyness Risk (df_vega)
+df_vega_binned = vrm.normalize_and_bin_vega(
+    df_vega_tsla, 
+    tenor_col="VegaTenor", 
+    value_col="Value", 
+    bins_years=BINS
+)
+
+# Pivot Binned Data
+pivot_binned_vega = pd.pivot_table(
+    df_vega_binned,
+    index="VegaMoneyness",
+    columns="BinnedTenor",
+    values="AllocatedValue",
+    aggfunc="sum",
+    fill_value=0.0
+)
+
+print("Normalized & Binned Vega by Moneyness:")
+display(pivot_binned_vega)
+
+
+# Jupyter Notebook Cell 4: Visualizations
+sns.set_theme(style="whitegrid")
+fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+
+# Plot 1: Unbinned Normalized Vega across Expiries
+# Let's run the normalizer without binning just to get the 'NormalizedValue'
+df_unbinned_norm = vrm.normalize_and_bin_vega(df_vega_tsla, "VegaTenor", "Value", bins_years=BINS)
+df_unbinned_agg = df_unbinned_norm.groupby("VegaTenor")["NormalizedValue"].sum().reset_index()
+
+sns.barplot(data=df_unbinned_agg, x="VegaTenor", y="NormalizedValue", ax=axes[0], color="royalblue")
+axes[0].set_title(f"{TICKER} - Unbinned Normalized Total Vega by Tenor")
+axes[0].set_xlabel("Time to Expiry (Years)")
+axes[0].set_ylabel("Normalized Vega Exposure")
+axes[0].tick_params(axis='x', rotation=45)
+
+# Plot 2: Binned Exposure Heatmap
+sns.heatmap(pivot_binned_vega, cmap="RdBu", center=0, annot=True, fmt=".0f", ax=axes[1])
+axes[1].set_title(f"{TICKER} - Binned Normalized Vega Exposure by Moneyness")
+axes[1].set_xlabel("Binned Tenor (Years)")
+axes[1].set_ylabel("Moneyness")
+
+plt.tight_layout()
+plt.show()
