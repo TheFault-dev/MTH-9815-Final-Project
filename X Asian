@@ -448,3 +448,72 @@ Change: def normalize_and_bin_vega(self, df, tenor_col, value_col, bins_years=(1
 • To: def plot_binned_heatmap(self, df_vega_agg, ticker="Portfolio"):
 • (Update internal references to use self.*)
 
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import pymfl
+from pymfl.translator import translate
+
+
+
+    def fetch_data(self, target_date, product_file_pattern="ESPU_Detailed_ProductUnderlier", vega_file_pattern="ESPU-MC_EquityVega_Risk"):
+        self.valuation_date = pd.to_datetime(target_date, format="%Y%m%d")
+        
+        if self.local_path:
+            local_dir = Path(self.local_path)
+            prod_local = local_dir / f"{target_date}_{product_file_pattern}.pkl"
+            vega_local = local_dir / f"{target_date}_{vega_file_pattern}.pkl"
+            
+            if prod_local.exists() and vega_local.exists():
+                print(f"Loading from local cache: {self.local_path}")
+                return pd.read_pickle(prod_local), pd.read_pickle(vega_local)
+                
+        base = Path(self.base_uri)
+        product_path = base / "Slides" / target_date / f"{target_date}_{product_file_pattern}.avro"
+        vega_path    = base / "PAA" / "EquityVol.Vega" / target_date / f"{vega_file_pattern}.avro"
+        
+        print(f"Fetching {product_path}...")
+        raw_prod = pymfl.xl().loadTable(fileName=str(product_path))
+        df_product = self._to_df(translate(pymfl.xl().unpack(raw_prod)))
+        
+        print(f"Fetching {vega_path}...")
+        raw_vega = pymfl.xl().loadTable(fileName=str(vega_path))
+        df_vega = self._to_df(translate(pymfl.xl().unpack(raw_vega)))
+        
+        if self.local_path:
+            df_product.to_pickle(prod_local)
+            df_vega.to_pickle(vega_local)
+            
+        return df_product, df_vega
+
+
+    def plot_portfolio_summary(self, df_vega_agg, top_n=10):
+        df = df_vega_agg.copy()
+        agg_port = df.groupby("RiskInstrument")["Value"].sum()
+
+        top_n = min(top_n, len(agg_port) // 2)
+        top_pos = agg_port[agg_port > 0].nlargest(top_n)
+        top_neg = agg_port[agg_port < 0].nsmallest(top_n)
+        
+        combined = pd.concat([top_pos, top_neg]).sort_values()
+        
+        if combined.empty:
+            print("No data available to plot portfolio summary.")
+            return
+
+        plt.figure(figsize=(12, 8))
+        colors = ['crimson' if val < 0 else 'royalblue' for val in combined.values]
+        sns.barplot(x=combined.values, y=combined.index, palette=colors)
+        
+        plt.axvline(0, color='black', linewidth=1)
+        plt.title(f"Top {top_n} Positive and Negative Portfolio Vega Exposures")
+        plt.xlabel("Net Vega Contribution")
+        plt.ylabel("Risk Instrument")
+        plt.grid(axis='x', alpha=0.3)
+        plt.show()
+
+
