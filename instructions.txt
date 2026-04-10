@@ -1,0 +1,20 @@
+The folder contains 3 categories of data:
+1. Options data, named like ivy*db. You can find detailed documentation in IvyDB US Reference Manual_01.12.2021.pdf.
+2. Market data available either before market open (mktdata_sod) or after market close (mktdata_eod). Please 
+3. Target data. In future_res_0934 we provide residual return from 09:34 to close, and in future_res_1554 ew provide residual return from 15:54 to T+N, where N ranges from 1 day to 20 days. A volatility estimate specific_risk is also provided, a common practice is to model standardized return instead of raw return.
+
+All data are stored in parquet files from 2010 to 2022 partitioned by year.
+
+What is the task?
+The task is to predict future residual returns using daily options data, also feel free to use market data.
+The forecast is generated at sod on daily basis, and we'd like to come up with 2 predictions, one maximizes predictive power of future_res_t0 at 0934, and the other maximizes predictive power of future_res_t5 at 1554.
+Final output format is a data frame with index = (date, id) and columns = (alpha_t0, alpha) corresponding to the two predictions, from 2018 to 2024.
+
+How do I understand the date and time in the data?
+For options and market data, it means that the data is available at that date and time. For example, on 20220101 at sod we can use either 20220101 sod options/market data, or 20211231 eod options/market data (and of course all the data prior to that), but you cannot use 20220101 eod data.
+For target data, all the returns are future values, i.e., future_res_t1 on 20220101 means residual return from 20220101 15:54:00 to 20220102 close (assuming both days are trading days). Target data can only be used in training as target or evaluation of your predictions, but cannot be used in modeling.
+
+How to evaluate results?
+In this project we use average of (non-demeaned) daily IC in a specific universe (riy or spx or ndx). If you train some machine learning model feel free to use a larger universe, but in evaluation we only use that specific universe.
+An example is also provided in US_options_example.ipynb.
+The ultimate evaluation will be conducted on a true out-of-sample set from 2023 to 2024 which is not included here, so feel free to divide your data into training/validation/testing/etc to handle overfitting.
